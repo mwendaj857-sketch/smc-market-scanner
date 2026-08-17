@@ -1,4 +1,3 @@
-
 name: SMC Market Scanner
 
 on:
@@ -35,6 +34,7 @@ jobs:
 
           INTERVAL = "15min"
           OUTPUT_SIZE = 500
+
           ATR_PERIOD = 14
           RSI_PERIOD = 14
 
@@ -63,7 +63,7 @@ jobs:
           }
 
           print("=" * 70)
-          print("🔥 SMC 9-METHOD MULTI-CONFLUENCE MARKET SCANNER")
+          print("SMC 9-METHOD MULTI-CONFLUENCE MARKET SCANNER")
           print("=" * 70)
           print("Timeframe:", INTERVAL)
           print("Markets:", ", ".join(SYMBOLS))
@@ -92,13 +92,17 @@ jobs:
                   "format": "JSON"
               }
 
-              response = requests.get(
-                  URL,
-                  params=params,
-                  timeout=30
-              )
-
-              data = response.json()
+              try:
+                  response = requests.get(
+                      URL,
+                      params=params,
+                      timeout=30
+                  )
+                  response.raise_for_status()
+                  data = response.json()
+              except Exception as e:
+                  print("REQUEST ERROR:", symbol, e)
+                  return []
 
               if "values" not in data:
                   print("API ERROR:", symbol, data)
@@ -124,17 +128,14 @@ jobs:
           def decimals(symbol):
               if symbol == "XAU/USD":
                   return 2
-
               if "JPY" in symbol:
                   return 3
-
               return 5
 
 
           def fmt(symbol, value):
               if value is None:
                   return "N/A"
-
               return f"{value:.{decimals(symbol)}f}"
 
 
@@ -149,13 +150,13 @@ jobs:
                   low = candles[i]["low"]
                   prev_close = candles[i - 1]["close"]
 
-                  tr = max(
-                      high - low,
-                      abs(high - prev_close),
-                      abs(low - prev_close)
+                  trs.append(
+                      max(
+                          high - low,
+                          abs(high - prev_close),
+                          abs(low - prev_close)
+                      )
                   )
-
-                  trs.append(tr)
 
               if len(trs) < period:
                   return None
@@ -224,12 +225,9 @@ jobs:
 
 
           def calculate_macd(candles):
-              closes = [
-                  x["close"]
-                  for x in candles
-              ]
+              closes = [x["close"] for x in candles]
 
-              if len(closes) < MACD_SLOW + MACD_SIGNAL:
+              if len(closes) < MACD_SLOW:
                   return None
 
               fast_ema = calculate_ema(
@@ -260,7 +258,6 @@ jobs:
               for j in range(1, strength + 1):
                   if high <= candles[i - j]["high"]:
                       return False
-
                   if high <= candles[i + j]["high"]:
                       return False
 
@@ -279,7 +276,6 @@ jobs:
               for j in range(1, strength + 1):
                   if low >= candles[i - j]["low"]:
                       return False
-
                   if low >= candles[i + j]["low"]:
                       return False
 
@@ -313,15 +309,8 @@ jobs:
               swing_highs,
               swing_lows
           ):
-              score = 0
-              direction = None
-              description = "NEUTRAL"
-
-              if len(swing_highs) < 2:
-                  return score, direction, description
-
-              if len(swing_lows) < 2:
-                  return score, direction, description
+              if len(swing_highs) < 2 or len(swing_lows) < 2:
+                  return 0, None, "NEUTRAL"
 
               last_high = swing_highs[-1]["price"]
               previous_high = swing_highs[-2]["price"]
@@ -340,20 +329,12 @@ jobs:
               )
 
               if bullish:
-                  score = 15
-                  direction = "BUY"
-                  description = "BULLISH HH + HL"
+                  return 15, "BUY", "BULLISH HH + HL"
 
-              elif bearish:
-                  score = 15
-                  direction = "SELL"
-                  description = "BEARISH LH + LL"
+              if bearish:
+                  return 15, "SELL", "BEARISH LH + LL"
 
-              else:
-                  score = 5
-                  description = "MIXED STRUCTURE"
-
-              return score, direction, description
+              return 5, None, "MIXED STRUCTURE"
 
 
           def find_sweeps(
@@ -363,10 +344,7 @@ jobs:
           ):
               sweeps = []
 
-              start = max(
-                  0,
-                  len(candles) - 40
-              )
+              start = max(0, len(candles) - 40)
 
               for i in range(start, len(candles)):
                   candle = candles[i]
@@ -429,7 +407,6 @@ jobs:
               )
 
               if sweep["type"] == "BULLISH":
-
                   previous_highs = [
                       x for x in swing_highs
                       if x["index"] < sweep_index
@@ -453,7 +430,6 @@ jobs:
                           }
 
               else:
-
                   previous_lows = [
                       x for x in swing_lows
                       if x["index"] < sweep_index
@@ -482,15 +458,8 @@ jobs:
           def find_fvg(candles, mss):
               mss_index = mss["index"]
 
-              start = max(
-                  2,
-                  mss_index
-              )
-
-              end = min(
-                  len(candles),
-                  mss_index + 8
-              )
+              start = max(2, mss_index)
+              end = min(len(candles), mss_index + 8)
 
               for i in range(start, end):
                   c0 = candles[i - 2]
@@ -519,6 +488,50 @@ jobs:
               return None
 
 
+          def smc_score(
+              candles,
+              swing_highs,
+              swing_lows
+          ):
+              sweeps = find_sweeps(
+                  candles,
+                  swing_highs,
+                  swing_lows
+              )
+
+              if not sweeps:
+                  return 0, None, None, None
+
+              latest_sweep = sweeps[-1]
+
+              mss = find_structure_break(
+                  candles,
+                  latest_sweep,
+                  swing_highs,
+                  swing_lows
+              )
+
+              if not mss:
+                  return 0, None, latest_sweep, None
+
+              fvg = find_fvg(
+                  candles,
+                  mss
+              )
+
+              if mss["type"] == "BULLISH MSS":
+                  direction = "BUY"
+              else:
+                  direction = "SELL"
+
+              score = 15
+
+              if fvg:
+                  score = 20
+
+              return score, direction, latest_sweep, fvg
+
+
           def supply_demand_score(
               candles,
               direction,
@@ -545,7 +558,6 @@ jobs:
                       continue
 
                   if direction == "BUY":
-
                       if (
                           base["close"] <= base["open"]
                           and impulse["close"] > impulse["open"]
@@ -553,7 +565,6 @@ jobs:
                           return 10, "DEMAND ZONE + BULLISH IMPULSE"
 
                   if direction == "SELL":
-
                       if (
                           base["close"] >= base["open"]
                           and impulse["close"] < impulse["open"]
@@ -619,7 +630,6 @@ jobs:
               )
 
               if direction == "BUY":
-
                   if bullish_engulfing:
                       return 10, "BULLISH ENGULFING"
 
@@ -629,8 +639,7 @@ jobs:
                   if c["close"] > c["open"]:
                       return 5, "BULLISH CANDLE"
 
-              else:
-
+              elif direction == "SELL":
                   if bearish_engulfing:
                       return 10, "BEARISH ENGULFING"
 
@@ -667,7 +676,6 @@ jobs:
                       "0.618": high - (high - low) * 0.618,
                       "0.786": high - (high - low) * 0.786
                   }
-
               else:
                   levels = {
                       "0.382": low + (high - low) * 0.382,
@@ -681,7 +689,6 @@ jobs:
               nearest_distance = float("inf")
 
               for name, level in levels.items():
-
                   distance = abs(
                       current - level
                   )
@@ -693,34 +700,4 @@ jobs:
               if nearest_distance <= tolerance:
                   return 5, f"NEAR FIB {nearest}"
 
-              return 2, f"FIB {nearest} NEARBY"
-
-
-          def trend_score(
-              candles,
-              direction
-          ):
-              closes = [
-                  x["close"]
-                  for x in candles
-              ]
-
-              ema20 = calculate_ema(
-                  closes,
-                  EMA_FAST
-              )
-
-              ema50 = calculate_ema(
-                  closes,
-                  EMA_MID
-              )
-
-              ema200 = calculate_ema(
-                  closes,
-                  EMA_SLOW
-              )
-
-              if ema20 is None or ema50 is None:
-                  return 0, "NO EMA DATA"
-
-       
+              return 2, f"FIB {nearest} NEARB 
