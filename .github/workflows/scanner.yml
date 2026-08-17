@@ -13,13 +13,14 @@ jobs:
       - name: Install requests
         run: pip install requests
 
-      - name: Test Twelve Data
+      - name: Stage 2 - SMC Market Scanner
         env:
           TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
         run: |
           python - <<'PY'
           import os
           import requests
+          from datetime import datetime, timezone
 
           API_KEY = os.environ["TWELVE_DATA_API_KEY"]
 
@@ -31,22 +32,401 @@ jobs:
               "XAU/USD"
           ]
 
-          url = "https://api.twelvedata.com/time_series"
+          INTERVAL = "15min"
+          OUTPUT_SIZE = 100
+
+          URL = "https://api.twelvedata.com/time_series"
+
+          print("================================")
+          print("SMC MARKET SCANNER - STAGE 2")
+          print("================================")
+          print("Timeframe:", INTERVAL)
+          print("Markets:", ", ".join(SYMBOLS))
+          print("Automatic trading: DISABLED")
+          print()
+
+          # ==========================================
+          # HELPER FUNCTIONS
+          # ==========================================
+
+          def get_float(candle, key):
+              try:
+                  return float(candle[key])
+              except:
+                  return None
+
+
+          def is_swing_high(candles, i, strength=2):
+              if i < strength or i >= len(candles) - strength:
+                  return False
+
+              high = candles[i]["high"]
+
+              for j in range(1, strength + 1):
+                  if high <= candles[i-j]["high"]:
+                      return False
+                  if high <= candles[i+j]["high"]:
+                      return False
+
+              return True
+
+
+          def is_swing_low(candles, i, strength=2):
+              if i < strength or i >= len(candles) - strength:
+                  return False
+
+              low = candles[i]["low"]
+
+              for j in range(1, strength + 1):
+                  if low >= candles[i-j]["low"]:
+                      return False
+                  if low >= candles[i+j]["low"]:
+                      return False
+
+              return True
+
+
+          def find_liquidity(candles):
+              swing_highs = []
+              swing_lows = []
+
+              for i in range(2, len(candles) - 2):
+
+                  if is_swing_high(candles, i):
+                      swing_highs.append({
+                          "index": i,
+                          "price": candles[i]["high"],
+                          "time": candles[i]["datetime"]
+                      })
+
+                  if is_swing_low(candles, i):
+                      swing_lows.append({
+                          "index": i,
+                          "price": candles[i]["low"],
+                          "time": candles[i]["datetime"]
+                      })
+
+              return swing_highs, swing_lows
+
+
+          def find_sweep(candles, swing_highs, swing_lows):
+              sweeps = []
+
+              # Look at the most recent candles first
+              start = max(0, len(candles) - 35)
+
+              for i in range(start, len(candles)):
+
+                  candle = candles[i]
+
+                  # ----------------------------------
+                  # Bearish liquidity sweep
+                  # Price takes previous swing high
+                  # then closes back below it.
+                  # ----------------------------------
+
+                  for level in reversed(swing_highs):
+
+                      if level["index"] >= i:
+                          continue
+
+                      if candle["high"] > level["price"]:
+                          if candle["close"] < level["price"]:
+
+                              sweeps.append({
+                                  "type": "BEARISH",
+                                  "index": i,
+                                  "liquidity": level["price"],
+                                  "time": candle["datetime"]
+                              })
+
+                              break
+
+                  # ----------------------------------
+                  # Bullish liquidity sweep
+                  # Price takes previous swing low
+                  # then closes back above it.
+                  # ----------------------------------
+
+                  for level in reversed(swing_lows):
+
+                      if level["index"] >= i:
+                          continue
+
+                      if candle["low"] < level["price"]:
+                          if candle["close"] > level["price"]:
+
+                              sweeps.append({
+                                  "type": "BULLISH",
+                                  "index": i,
+                                  "liquidity": level["price"],
+                                  "time": candle["datetime"]
+                              })
+
+                              break
+
+              return sweeps
+
+
+          def find_structure_break(candles, sweep, swing_highs, swing_lows):
+              sweep_index = sweep["index"]
+              direction = sweep["type"]
+
+              search_end = min(
+                  len(candles),
+                  sweep_index + 11
+              )
+
+              # ======================================
+              # BULLISH MSS / CHOCH
+              # ======================================
+
+              if direction == "BULLISH":
+
+                  previous_highs = [
+                      x for x in swing_highs
+                      if x["index"] < sweep_index
+                  ]
+
+                  if not previous_highs:
+                      return None
+
+                  target = previous_highs[-1]
+
+                  for i in range(sweep_index + 1, search_end):
+
+                      if candles[i]["close"] > target["price"]:
+
+                          return {
+                              "type": "BULLISH MSS",
+                              "index": i,
+                              "level": target["price"],
+                              "time": candles[i]["datetime"]
+                          }
+
+              # ======================================
+              # BEARISH MSS / CHOCH
+              # ======================================
+
+              if direction == "BEARISH":
+
+                  previous_lows = [
+                      x for x in swing_lows
+                      if x["index"] < sweep_index
+                  ]
+
+                  if not previous_lows:
+                      return None
+
+                  target = previous_lows[-1]
+
+                  for i in range(sweep_index + 1, search_end):
+
+                      if candles[i]["close"] < target["price"]:
+
+                          return {
+                              "type": "BEARISH MSS",
+                              "index": i,
+                              "level": target["price"],
+                              "time": candles[i]["datetime"]
+                          }
+
+              return None
+
+
+          def find_fvg(candles, mss):
+              mss_index = mss["index"]
+
+              # Search a few candles around/after MSS
+              start = max(2, mss_index - 1)
+              end = min(len(candles), mss_index + 7)
+
+              for i in range(start, end):
+
+                  if i < 2:
+                      continue
+
+                  c0 = candles[i-2]
+                  c1 = candles[i-1]
+                  c2 = candles[i]
+
+                  # ==================================
+                  # BULLISH FVG
+                  # Current low > candle two bars back high
+                  # ==================================
+
+                  if mss["type"] == "BULLISH MSS":
+
+                      if c2["low"] > c0["high"]:
+
+                          return {
+                              "type": "BULLISH FVG",
+                              "index": i,
+                              "low": c0["high"],
+                              "high": c2["low"],
+                              "time": c2["datetime"]
+                          }
+
+                  # ==================================
+                  # BEARISH FVG
+                  # Current high < candle two bars back low
+                  # ==================================
+
+                  if mss["type"] == "BEARISH MSS":
+
+                      if c2["high"] < c0["low"]:
+
+                          return {
+                              "type": "BEARISH FVG",
+                              "low": c2["high"],
+                              "high": c0["low"],
+                              "index": i,
+                              "time": c2["datetime"]
+                          }
+
+              return None
+
+
+          def scan_market(symbol, candles):
+
+              print()
+              print("================================")
+              print("MARKET:", symbol)
+              print("================================")
+
+              if len(candles) < 30:
+                  print("❌ Not enough candles")
+                  return
+
+              # --------------------------------------
+              # Ignore newest candle because it may
+              # still be forming.
+              # --------------------------------------
+
+              candles = candles[1:]
+
+              swing_highs, swing_lows = find_liquidity(candles)
+
+              print("Swing highs:", len(swing_highs))
+              print("Swing lows:", len(swing_lows))
+
+              if swing_highs:
+                  latest_high = swing_highs[-1]
+
+                  print(
+                      "Latest liquidity HIGH:",
+                      latest_high["price"],
+                      "@",
+                      latest_high["time"]
+                  )
+
+              if swing_lows:
+                  latest_low = swing_lows[-1]
+
+                  print(
+                      "Latest liquidity LOW:",
+                      latest_low["price"],
+                      "@",
+                      latest_low["time"]
+                  )
+
+              sweeps = find_sweep(
+                  candles,
+                  swing_highs,
+                  swing_lows
+              )
+
+              print("Liquidity sweeps found:", len(sweeps))
+
+              if not sweeps:
+                  print("STATUS: NO LIQUIDITY SWEEP")
+                  return
+
+              # Use the most recent sweep
+              sweep = sweeps[-1]
+
+              print()
+              print("🔥 LIQUIDITY SWEEP")
+              print("Direction:", sweep["type"])
+              print("Liquidity:", sweep["liquidity"])
+              print("Time:", sweep["time"])
+
+              mss = find_structure_break(
+                  candles,
+                  sweep,
+                  swing_highs,
+                  swing_lows
+              )
+
+              if not mss:
+                  print("STATUS: SWEEP FOUND - NO MSS/CHOCH")
+                  return
+
+              print()
+              print("🔥 MSS / CHOCH")
+              print("Type:", mss["type"])
+              print("Break level:", mss["level"])
+              print("Time:", mss["time"])
+
+              fvg = find_fvg(
+                  candles,
+                  mss
+              )
+
+              if not fvg:
+                  print("STATUS: MSS FOUND - NO FVG")
+                  return
+
+              print()
+              print("🔥 FAIR VALUE GAP")
+              print("Type:", fvg["type"])
+              print("FVG Low:", fvg["low"])
+              print("FVG High:", fvg["high"])
+              print("Time:", fvg["time"])
+
+              current = candles[-1]["close"]
+
+              print()
+              print("================================")
+              print("🚨 SMC SETUP DETECTED")
+              print("================================")
+              print("Market:", symbol)
+              print("Direction:", mss["type"])
+              print("Liquidity sweep:", sweep["type"])
+              print("Liquidity level:", sweep["liquidity"])
+              print("MSS level:", mss["level"])
+              print("FVG:", fvg["low"], "-", fvg["high"])
+              print("Current price:", current)
+              print("================================")
+
+              # --------------------------------------
+              # Entry status
+              # --------------------------------------
+
+              if fvg["low"] <= current <= fvg["high"]:
+                  print("ENTRY STATUS: PRICE INSIDE FVG")
+              else:
+                  print("ENTRY STATUS: WAIT FOR FVG RETEST")
+
+              print("AUTOMATIC TRADING: DISABLED")
+
+
+          # ==========================================
+          # REQUEST TWELVE DATA
+          # ==========================================
 
           params = {
               "symbol": ",".join(SYMBOLS),
-              "interval": "15min",
-              "outputsize": 10,
+              "interval": INTERVAL,
+              "outputsize": OUTPUT_SIZE,
               "apikey": API_KEY
           }
 
           print("Requesting Twelve Data market data...")
-          print("Markets:", ", ".join(SYMBOLS))
-          print("Timeframe: 15min")
           print()
 
           response = requests.get(
-              url,
+              URL,
               params=params,
               timeout=30
           )
@@ -64,6 +444,10 @@ jobs:
 
           success = 0
           failed = 0
+
+          # ==========================================
+          # PROCESS EACH MARKET
+          # ==========================================
 
           for symbol in SYMBOLS:
 
@@ -89,27 +473,63 @@ jobs:
                   failed += 1
                   continue
 
-              latest = values[0]
+              candles = []
 
-              print(f"✅ {symbol}")
-              print(f"   Time:  {latest.get('datetime')}")
-              print(f"   Open:  {latest.get('open')}")
-              print(f"   High:  {latest.get('high')}")
-              print(f"   Low:   {latest.get('low')}")
-              print(f"   Close: {latest.get('close')}")
+              for item in values:
+
+                  try:
+
+                      candle = {
+                          "datetime": item["datetime"],
+                          "open": float(item["open"]),
+                          "high": float(item["high"]),
+                          "low": float(item["low"]),
+                          "close": float(item["close"])
+                      }
+
+                      candles.append(candle)
+
+                  except Exception:
+                      continue
+
+              if len(candles) < 30:
+                  print(
+                      f"❌ {symbol}: "
+                      f"Only {len(candles)} valid candles"
+                  )
+                  failed += 1
+                  continue
+
+              # Twelve Data normally returns newest first.
+              # Reverse so analysis runs chronologically.
+              candles.reverse()
+
+              print(f"✅ {symbol}: {len(candles)} candles loaded")
+
+              scan_market(
+                  symbol,
+                  candles
+              )
 
               success += 1
 
+          # ==========================================
+          # FINAL STATUS
+          # ==========================================
+
           print()
           print("================================")
-          print("Twelve Data test completed")
+          print("STAGE 2 SCAN COMPLETED")
+          print("================================")
           print(f"Successful markets: {success}")
           print(f"Failed markets: {failed}")
+          print("Timeframe:", INTERVAL)
           print("Automatic trading: DISABLED")
           print("================================")
 
           if success == 0:
               raise SystemExit(
-                  "No market data was successfully retrieved."
+                  "No market data was successfully processed."
               )
+
           PY
