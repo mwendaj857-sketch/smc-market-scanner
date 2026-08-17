@@ -1,0 +1,436 @@
+name: SMC Market Scanner
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/5 * * * *"
+
+jobs:
+  scanner:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install requests
+        run: pip install requests
+
+      - name: SMC 9-Method Market Scanner
+        env:
+          TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
+        run: |
+          python - <<'PY'
+          import os
+          import requests
+
+          API_KEY = os.environ.get("TWELVE_DATA_API_KEY", "").strip()
+          if not API_KEY:
+              raise SystemExit("TWELVE_DATA_API_KEY secret is missing.")
+
+          SYMBOLS = ["EUR/USD", "GBP/USD", "USD/JPY", "USD/CAD", "XAU/USD"]
+          INTERVAL = "15min"
+          OUTPUT_SIZE = 500
+          ATR_PERIOD = 14
+          RSI_PERIOD = 14
+          EMA_FAST = 20
+          EMA_MID = 50
+          EMA_SLOW = 200
+          SL_ATR_MULTIPLIER = 0.25
+          RR_TARGET = 2.0
+          URL = "https://api.twelvedata.com/time_series"
+
+          WEIGHTS = {
+              "Market Structure": 15,
+              "Smart Money Concepts": 20,
+              "Supply & Demand": 10,
+              "Price Action": 10,
+              "Liquidity": 15,
+              "Fibonacci": 5,
+              "Trend": 10,
+              "Indicators": 5,
+              "Forex Session": 10,
+          }
+
+          def fmt(symbol, value):
+              if value is None:
+                  return "N/A"
+              decimals = 2 if symbol == "XAU/USD" else 3 if "JPY" in symbol else 5
+              return f"{value:.{decimals}f}"
+
+          def get_candles(symbol):
+              params = {
+                  "symbol": symbol,
+                  "interval": INTERVAL,
+                  "outputsize": OUTPUT_SIZE,
+                  "apikey": API_KEY,
+                  "format": "JSON",
+              }
+              try:
+                  r = requests.get(URL, params=params, timeout=30)
+                  r.raise_for_status()
+                  data = r.json()
+              except Exception as exc:
+                  print(f"REQUEST ERROR: {symbol}: {exc}")
+                  return []
+
+              if "values" not in data:
+                  print(f"API ERROR: {symbol}: {data}")
+                  return []
+
+              candles = []
+              for item in reversed(data["values"]):
+                  try:
+                      candles.append({
+                          "datetime": item["datetime"],
+                          "open": float(item["open"]),
+                          "high": float(item["high"]),
+                          "low": float(item["low"]),
+                          "close": float(item["close"]),
+                      })
+                  except (KeyError, TypeError, ValueError):
+                      continue
+              return candles
+
+          def atr(candles, period=14):
+              if len(candles) < period + 1:
+                  return None
+              trs = []
+              for i in range(1, len(candles)):
+                  h = candles[i]["high"]
+                  l = candles[i]["low"]
+                  pc = candles[i - 1]["close"]
+                  trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+              value = sum(trs[:period]) / period
+              for tr in trs[period:]:
+                  value = ((value * (period - 1)) + tr) / period
+              return value
+
+          def ema(values, period):
+              if len(values) < period:
+                  return None
+              multiplier = 2.0 / (period + 1)
+              value = sum(values[:period]) / period
+              for price in values[period:]:
+                  value = (price - value) * multiplier + value
+              return value
+
+          def rsi(candles, period=14):
+              if len(candles) < period + 1:
+                  return None
+              gains, losses = [], []
+              for i in range(1, len(candles)):
+                  change = candles[i]["close"] - candles[i - 1]["close"]
+                  gains.append(max(change, 0.0))
+                  losses.append(max(-change, 0.0))
+              avg_gain = sum(gains[:period]) / period
+              avg_loss = sum(losses[:period]) / period
+              for i in range(period, len(gains)):
+                  avg_gain = ((avg_gain * (period - 1)) + gains[i]) / period
+                  avg_loss = ((avg_loss * (period - 1)) + losses[i]) / period
+              if avg_loss == 0:
+                  return 100.0
+              return 100.0 - (100.0 / (1.0 + avg_gain / avg_loss))
+
+          def macd(candles):
+              closes = [c["close"] for c in candles]
+              fast = ema(closes, 12)
+              slow = ema(closes, 26)
+              if fast is None or slow is None:
+                  return None
+              return fast - slow
+
+          def swing_high(candles, i, strength=2):
+              if i < strength or i >= len(candles) - strength:
+                  return False
+              h = candles[i]["high"]
+              return all(
+                  h > candles[i - j]["high"] and h > candles[i + j]["high"]
+                  for j in range(1, strength + 1)
+              )
+
+          def swing_low(candles, i, strength=2):
+              if i < strength or i >= len(candles) - strength:
+                  return False
+              l = candles[i]["low"]
+              return all(
+                  l < candles[i - j]["low"] and l < candles[i + j]["low"]
+                  for j in range(1, strength + 1)
+              )
+
+          def find_swings(candles):
+              highs, lows = [], []
+              for i in range(2, len(candles) - 2):
+                  if swing_high(candles, i):
+                      highs.append({"index": i, "price": candles[i]["high"]})
+                  if swing_low(candles, i):
+                      lows.append({"index": i, "price": candles[i]["low"]})
+              return highs, lows
+
+          def market_structure(highs, lows):
+              if len(highs) < 2 or len(lows) < 2:
+                  return 0, None, "INSUFFICIENT SWINGS"
+              hh = highs[-1]["price"] > highs[-2]["price"]
+              hl = lows[-1]["price"] > lows[-2]["price"]
+              lh = highs[-1]["price"] < highs[-2]["price"]
+              ll = lows[-1]["price"] < lows[-2]["price"]
+              if hh and hl:
+                  return 15, "BUY", "BULLISH HH + HL"
+              if lh and ll:
+                  return 15, "SELL", "BEARISH LH + LL"
+              return 5, None, "MIXED STRUCTURE"
+
+          def find_sweeps(candles, highs, lows):
+              sweeps = []
+              start = max(0, len(candles) - 50)
+              for i in range(start, len(candles)):
+                  c = candles[i]
+                  prior_highs = [x for x in highs if x["index"] < i]
+                  prior_lows = [x for x in lows if x["index"] < i]
+                  if prior_highs:
+                      level = prior_highs[-1]["price"]
+                      if c["high"] > level and c["close"] < level:
+                          sweeps.append({"type": "BEARISH", "index": i, "level": level})
+                  if prior_lows:
+                      level = prior_lows[-1]["price"]
+                      if c["low"] < level and c["close"] > level:
+                          sweeps.append({"type": "BULLISH", "index": i, "level": level})
+              return sweeps
+
+          def smc_signal(candles, highs, lows):
+              sweeps = find_sweeps(candles, highs, lows)
+              if not sweeps:
+                  return 0, None, "NO RECENT LIQUIDITY SWEEP", None
+              sweep = sweeps[-1]
+              start = sweep["index"] + 1
+              end = min(len(candles), start + 10)
+
+              if sweep["type"] == "BULLISH":
+                  targets = [x for x in highs if x["index"] < sweep["index"]]
+                  if not targets:
+                      return 0, None, "SWEEP WITHOUT MSS", sweep
+                  level = targets[-1]["price"]
+                  for i in range(start, end):
+                      if candles[i]["close"] > level:
+                          return 20, "BUY", "BULLISH MSS", sweep
+              else:
+                  targets = [x for x in lows if x["index"] < sweep["index"]]
+                  if not targets:
+                      return 0, None, "SWEEP WITHOUT MSS", sweep
+                  level = targets[-1]["price"]
+                  for i in range(start, end):
+                      if candles[i]["close"] < level:
+                          return 20, "SELL", "BEARISH MSS", sweep
+              return 0, None, "SWEEP WITHOUT MSS", sweep
+
+          def supply_demand(candles, direction, atr_value):
+              if direction is None or atr_value is None or len(candles) < 6:
+                  return 0, "NO VALID SETUP"
+              recent = candles[-12:]
+              for i in range(2, len(recent)):
+                  base = recent[i - 2]
+                  impulse = recent[i]
+                  move = abs(impulse["close"] - base["close"])
+                  if move < atr_value * 0.8:
+                      continue
+                  if direction == "BUY" and base["close"] <= base["open"] and impulse["close"] > impulse["open"]:
+                      return 10, "DEMAND ZONE + BULLISH IMPULSE"
+                  if direction == "SELL" and base["close"] >= base["open"] and impulse["close"] < impulse["open"]:
+                      return 10, "SUPPLY ZONE + BEARISH IMPULSE"
+              return 3, "WEAK SUPPLY/DEMAND"
+
+          def price_action(candles, direction):
+              if len(candles) < 2 or direction is None:
+                  return 0, "NO DIRECTION"
+              c, p = candles[-1], candles[-2]
+              body = abs(c["close"] - c["open"])
+              upper = c["high"] - max(c["open"], c["close"])
+              lower = min(c["open"], c["close"]) - c["low"]
+
+              bull_engulf = (
+                  p["close"] < p["open"] and c["close"] > c["open"]
+                  and c["open"] <= p["close"] and c["close"] >= p["open"]
+              )
+              bear_engulf = (
+                  p["close"] > p["open"] and c["close"] < c["open"]
+                  and c["open"] >= p["close"] and c["close"] <= p["open"]
+              )
+
+              if direction == "BUY":
+                  if bull_engulf:
+                      return 10, "BULLISH ENGULFING"
+                  if body > 0 and lower > body * 1.5 and c["close"] > c["open"]:
+                      return 8, "BULLISH REJECTION"
+                  if c["close"] > c["open"]:
+                      return 5, "BULLISH CANDLE"
+              else:
+                  if bear_engulf:
+                      return 10, "BEARISH ENGULFING"
+                  if body > 0 and upper > body * 1.5 and c["close"] < c["open"]:
+                      return 8, "BEARISH REJECTION"
+                  if c["close"] < c["open"]:
+                      return 5, "BEARISH CANDLE"
+              return 0, "NO STRONG PRICE ACTION"
+
+          def liquidity_score(sweeps, direction):
+              if not sweeps or direction is None:
+                  return 0, "NO RECENT SWEEP"
+              latest = sweeps[-1]
+              if (
+                  (direction == "BUY" and latest["type"] == "BULLISH")
+                  or (direction == "SELL" and latest["type"] == "BEARISH")
+              ):
+                  return 15, f"{latest['type']} LIQUIDITY SWEEP"
+              return 5, "OPPOSING LIQUIDITY SWEEP"
+
+          def fibonacci(candles, highs, lows, direction):
+              if not highs or not lows or direction is None:
+                  return 0, "NO SWINGS"
+              high, low = highs[-1]["price"], lows[-1]["price"]
+              if high <= low:
+                  return 0, "INVALID RANGE"
+              current = candles[-1]["close"]
+
+              if direction == "BUY":
+                  levels = {
+                      "0.382": high - (high - low) * 0.382,
+                      "0.500": high - (high - low) * 0.500,
+                      "0.618": high - (high - low) * 0.618,
+                      "0.786": high - (high - low) * 0.786,
+                  }
+              else:
+                  levels = {
+                      "0.382": low + (high - low) * 0.382,
+                      "0.500": low + (high - low) * 0.500,
+                      "0.618": low + (high - low) * 0.618,
+                      "0.786": low + (high - low) * 0.786,
+                  }
+
+              nearest = min(levels, key=lambda k: abs(current - levels[k]))
+              tolerance = (high - low) * 0.03
+              if abs(current - levels[nearest]) <= tolerance:
+                  return 5, f"NEAR FIB {nearest}"
+              return 2, f"FIB {nearest} NOT NEAR"
+
+          def trend(candles, direction):
+              closes = [c["close"] for c in candles]
+              e20 = ema(closes, EMA_FAST)
+              e50 = ema(closes, EMA_MID)
+              e200 = ema(closes, EMA_SLOW)
+              if None in (e20, e50, e200) or direction is None:
+                  return 0, "INSUFFICIENT DATA"
+              if direction == "BUY" and e20 > e50 > e200:
+                  return 10, "BULLISH EMA ALIGNMENT"
+              if direction == "SELL" and e20 < e50 < e200:
+                  return 10, "BEARISH EMA ALIGNMENT"
+              return 3, "MIXED EMA ALIGNMENT"
+
+          def indicators(candles, direction):
+              r = rsi(candles, RSI_PERIOD)
+              m = macd(candles)
+              if r is None or m is None or direction is None:
+                  return 0, "INSUFFICIENT DATA", r, m
+              if direction == "BUY":
+                  score = 5 if r >= 50 and m > 0 else 2
+              else:
+                  score = 5 if r <= 50 and m < 0 else 2
+              return score, f"RSI {r:.2f} / MACD {m:.6f}", r, m
+
+          def session_score(candles):
+              hour = int(candles[-1]["datetime"][11:13])
+              if 12 <= hour < 16:
+                  return 10, "LONDON + NEW YORK OVERLAP"
+              if 7 <= hour < 16:
+                  return 8, "LONDON SESSION"
+              if 12 <= hour < 21:
+                  return 8, "NEW YORK SESSION"
+              return 3, "OTHER SESSION"
+
+          def scan(symbol):
+              candles = get_candles(symbol)
+              if len(candles) < 220:
+                  print(f"\n{symbol}: insufficient candle data ({len(candles)})")
+                  return
+
+              current = candles[-1]["close"]
+              atr_value = atr(candles, ATR_PERIOD)
+              highs, lows = find_swings(candles)
+
+              ms_s, ms_direction, ms_text = market_structure(highs, lows)
+              smc_s, smc_direction, smc_text, _ = smc_signal(candles, highs, lows)
+
+              direction = smc_direction or ms_direction
+              sd_s, sd_text = supply_demand(candles, direction, atr_value)
+              pa_s, pa_text = price_action(candles, direction)
+              sweeps = find_sweeps(candles, highs, lows)
+              liq_s, liq_text = liquidity_score(sweeps, direction)
+              fib_s, fib_text = fibonacci(candles, highs, lows, direction)
+              trend_s, trend_text = trend(candles, direction)
+              ind_s, ind_text, _, _ = indicators(candles, direction)
+              session_s, session_text = session_score(candles)
+
+              scores = [
+                  ms_s, smc_s, sd_s, pa_s, liq_s,
+                  fib_s, trend_s, ind_s, session_s
+              ]
+              total = sum(scores)
+
+              if direction is None:
+                  direction = "NEUTRAL"
+
+              if total >= 75 and direction != "NEUTRAL":
+                  signal = "STRONG"
+              elif total >= 60 and direction != "NEUTRAL":
+                  signal = "MODERATE"
+              else:
+                  signal = "WEAK"
+
+              entry = sl = tp = None
+              if direction == "BUY" and atr_value:
+                  entry = current
+                  sl = entry - atr_value * SL_ATR_MULTIPLIER
+                  tp = entry + (entry - sl) * RR_TARGET
+              elif direction == "SELL" and atr_value:
+                  entry = current
+                  sl = entry + atr_value * SL_ATR_MULTIPLIER
+                  tp = entry - (sl - entry) * RR_TARGET
+
+              print("\n" + "=" * 70)
+              print(symbol)
+              print("=" * 70)
+              print(f"Direction: {direction}")
+              print(f"Signal: {signal}")
+              print(f"Score: {total}/100")
+              print()
+              print(f"1. Market Structure: {ms_s}/15 {ms_text}")
+              print(f"2. Smart Money Concepts: {smc_s}/20 {smc_text}")
+              print(f"3. Supply & Demand: {sd_s}/10 {sd_text}")
+              print(f"4. Price Action: {pa_s}/10 {pa_text}")
+              print(f"5. Liquidity: {liq_s}/15 {liq_text}")
+              print(f"6. Fibonacci: {fib_s}/5 {fib_text}")
+              print(f"7. Trend: {trend_s}/10 {trend_text}")
+              print(f"8. Indicators: {ind_s}/5 {ind_text}")
+              print(f"9. Session: {session_s}/10 {session_text}")
+              print()
+              print(f"Price: {fmt(symbol, current)}")
+              print(f"ATR: {fmt(symbol, atr_value)}")
+              print(f"Entry: {fmt(symbol, entry)}")
+              print(f"Stop Loss: {fmt(symbol, sl)}")
+              print(f"Take Profit: {fmt(symbol, tp)}")
+              print("Risk/Reward: 1:2.00" if entry is not None else "Risk/Reward: N/A")
+
+          print("=" * 70)
+          print("SMC 9-METHOD MULTI-CONFLUENCE MARKET SCANNER")
+          print("=" * 70)
+          print(f"Timeframe: {INTERVAL}")
+          print("Markets:", ", ".join(SYMBOLS))
+          print(f"Candles: {OUTPUT_SIZE}")
+          print("Automatic trading: DISABLED")
+          print("Weights: Market Structure=15, SMC=20, Supply/Demand=10, Price Action=10, Liquidity=15, Fibonacci=5, Trend=10, Indicators=5, Session=10")
+
+          for symbol in SYMBOLS:
+              try:
+                  scan(symbol)
+              except Exception as exc:
+                  print(f"\nSCAN ERROR: {symbol}: {type(exc).__name__}: {exc}")
+
+          print("\nSCAN COMPLETE")
+          print("Automatic trading remains disabled.")
+          PY
