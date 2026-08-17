@@ -32,32 +32,16 @@ jobs:
           ]
 
           INTERVAL = "15min"
-
-          # ==========================================
-          # SETTINGS
-          # ==========================================
-
-          # Try 2000 first.
-          # If unavailable, automatically try 1000,
-          # then 500.
           OUTPUT_SIZES = [2000, 1000, 500]
-
-          URL = "https://api.twelvedata.com/time_series"
 
           SMA_FAST = 100
           SMA_SLOW = 200
-
           RMA_FAST = 100
           RMA_SLOW = 200
-
           ATR_PERIOD = 14
-
-          # Stop-loss buffer beyond liquidity sweep
           SL_ATR_MULTIPLIER = 0.25
 
-          # ==========================================
-          # HEADER
-          # ==========================================
+          URL = "https://api.twelvedata.com/time_series"
 
           print("================================")
           print("SMC MARKET SCANNER - STAGE 2")
@@ -70,50 +54,31 @@ jobs:
           print("Automatic trading: DISABLED")
           print()
 
-          # ==========================================
-          # SMA
-          # ==========================================
-
           def full_sma(values, period):
-
               result = [None] * len(values)
 
               if len(values) < period:
                   return result
 
               for i in range(period - 1, len(values)):
-
-                  window = values[
-                      i - period + 1:i + 1
-                  ]
-
-                  result[i] = sum(window) / period
+                  result[i] = sum(
+                      values[i - period + 1:i + 1]
+                  ) / period
 
               return result
 
-          # ==========================================
-          # RMA / WILDER MOVING AVERAGE
-          # ==========================================
-
           def full_rma(values, period):
-
               result = [None] * len(values)
 
               if len(values) < period:
                   return result
 
-              current = (
-                  sum(values[:period]) / period
-              )
-
+              current = sum(values[:period]) / period
               result[period - 1] = current
 
               for i in range(period, len(values)):
-
                   current = (
-                      (
-                          current * (period - 1)
-                      )
+                      current * (period - 1)
                       + values[i]
                   ) / period
 
@@ -121,68 +86,44 @@ jobs:
 
               return result
 
-          # ==========================================
-          # ATR
-          # ==========================================
-
           def calculate_atr(candles, period=14):
-
               if len(candles) < period + 1:
                   return None
 
-              true_ranges = []
+              trs = []
 
               for i in range(1, len(candles)):
-
                   high = candles[i]["high"]
                   low = candles[i]["low"]
                   previous_close = candles[i - 1]["close"]
 
-                  tr = max(
-                      high - low,
-                      abs(high - previous_close),
-                      abs(low - previous_close)
+                  trs.append(
+                      max(
+                          high - low,
+                          abs(high - previous_close),
+                          abs(low - previous_close)
+                      )
                   )
 
-                  true_ranges.append(tr)
-
-              if len(true_ranges) < period:
+              if len(trs) < period:
                   return None
 
-              atr_value = (
-                  sum(true_ranges[:period]) / period
-              )
+              atr = sum(trs[:period]) / period
 
-              for tr in true_ranges[period:]:
-
-                  atr_value = (
-                      (
-                          atr_value * (period - 1)
-                      ) + tr
+              for tr in trs[period:]:
+                  atr = (
+                      atr * (period - 1) + tr
                   ) / period
 
-              return atr_value
+              return atr
 
-          # ==========================================
-          # SWING HIGH
-          # ==========================================
-
-          def is_swing_high(
-              candles,
-              i,
-              strength=2
-          ):
-
-              if (
-                  i < strength
-                  or i >= len(candles) - strength
-              ):
+          def is_swing_high(candles, i, strength=2):
+              if i < strength or i >= len(candles) - strength:
                   return False
 
               high = candles[i]["high"]
 
               for j in range(1, strength + 1):
-
                   if high <= candles[i - j]["high"]:
                       return False
 
@@ -191,26 +132,13 @@ jobs:
 
               return True
 
-          # ==========================================
-          # SWING LOW
-          # ==========================================
-
-          def is_swing_low(
-              candles,
-              i,
-              strength=2
-          ):
-
-              if (
-                  i < strength
-                  or i >= len(candles) - strength
-              ):
+          def is_swing_low(candles, i, strength=2):
+              if i < strength or i >= len(candles) - strength:
                   return False
 
               low = candles[i]["low"]
 
               for j in range(1, strength + 1):
-
                   if low >= candles[i - j]["low"]:
                       return False
 
@@ -219,22 +147,12 @@ jobs:
 
               return True
 
-          # ==========================================
-          # FIND LIQUIDITY
-          # ==========================================
-
           def find_liquidity(candles):
-
               swing_highs = []
               swing_lows = []
 
-              for i in range(
-                  2,
-                  len(candles) - 2
-              ):
-
+              for i in range(2, len(candles) - 2):
                   if is_swing_high(candles, i):
-
                       swing_highs.append({
                           "index": i,
                           "price": candles[i]["high"],
@@ -242,7 +160,6 @@ jobs:
                       })
 
                   if is_swing_low(candles, i):
-
                       swing_lows.append({
                           "index": i,
                           "price": candles[i]["low"],
@@ -251,88 +168,47 @@ jobs:
 
               return swing_highs, swing_lows
 
-          # ==========================================
-          # LIQUIDITY SWEEP
-          # ==========================================
-
-          def find_sweep(
-              candles,
-              swing_highs,
-              swing_lows
-          ):
-
+          def find_sweep(candles, swing_highs, swing_lows):
               sweeps = []
 
-              start = max(
-                  0,
-                  len(candles) - 35
-              )
+              start = max(0, len(candles) - 35)
 
               for i in range(start, len(candles)):
-
                   candle = candles[i]
 
-                  # ----------------------------------
-                  # BEARISH SWEEP
-                  # Takes buy-side liquidity
-                  # and closes back below.
-                  # ----------------------------------
-
                   for level in reversed(swing_highs):
-
                       if level["index"] >= i:
                           continue
 
                       if (
-                          candle["high"]
-                          > level["price"]
-                          and
-                          candle["close"]
-                          < level["price"]
+                          candle["high"] > level["price"]
+                          and candle["close"] < level["price"]
                       ):
-
                           sweeps.append({
                               "type": "BEARISH",
                               "index": i,
                               "liquidity": level["price"],
                               "time": candle["datetime"]
                           })
-
                           break
 
-                  # ----------------------------------
-                  # BULLISH SWEEP
-                  # Takes sell-side liquidity
-                  # and closes back above.
-                  # ----------------------------------
-
                   for level in reversed(swing_lows):
-
                       if level["index"] >= i:
                           continue
 
                       if (
-                          candle["low"]
-                          < level["price"]
-                          and
-                          candle["close"]
-                          > level["price"]
+                          candle["low"] < level["price"]
+                          and candle["close"] > level["price"]
                       ):
-
                           sweeps.append({
                               "type": "BULLISH",
                               "index": i,
                               "liquidity": level["price"],
                               "time": candle["datetime"]
                           })
-
                           break
 
               return sweeps
-
-          # ==========================================
-          # MSS / CHOCH
-          # ==========================================
 
           def find_structure_break(
               candles,
@@ -340,7 +216,6 @@ jobs:
               swing_highs,
               swing_lows
           ):
-
               sweep_index = sweep["index"]
               direction = sweep["type"]
 
@@ -349,15 +224,9 @@ jobs:
                   sweep_index + 11
               )
 
-              # --------------------------------------
-              # BULLISH MSS
-              # --------------------------------------
-
               if direction == "BULLISH":
-
                   previous_highs = [
-                      x
-                      for x in swing_highs
+                      x for x in swing_highs
                       if x["index"] < sweep_index
                   ]
 
@@ -370,12 +239,7 @@ jobs:
                       sweep_index + 1,
                       search_end
                   ):
-
-                      if (
-                          candles[i]["close"]
-                          > target["price"]
-                      ):
-
+                      if candles[i]["close"] > target["price"]:
                           return {
                               "type": "BULLISH MSS",
                               "index": i,
@@ -383,15 +247,9 @@ jobs:
                               "time": candles[i]["datetime"]
                           }
 
-              # --------------------------------------
-              # BEARISH MSS
-              # --------------------------------------
-
               if direction == "BEARISH":
-
                   previous_lows = [
-                      x
-                      for x in swing_lows
+                      x for x in swing_lows
                       if x["index"] < sweep_index
                   ]
 
@@ -404,12 +262,7 @@ jobs:
                       sweep_index + 1,
                       search_end
                   ):
-
-                      if (
-                          candles[i]["close"]
-                          < target["price"]
-                      ):
-
+                      if candles[i]["close"] < target["price"]:
                           return {
                               "type": "BEARISH MSS",
                               "index": i,
@@ -419,41 +272,21 @@ jobs:
 
               return None
 
-          # ==========================================
-          # FIND FVG
-          # ==========================================
-
           def find_fvg(candles, mss):
-
               mss_index = mss["index"]
 
-              start = max(
-                  2,
-                  mss_index - 1
-              )
-
-              end = min(
-                  len(candles),
-                  mss_index + 7
-              )
+              start = max(2, mss_index - 1)
+              end = min(len(candles), mss_index + 7)
 
               for i in range(start, end):
-
                   if i < 2:
                       continue
 
                   c0 = candles[i - 2]
-                  c1 = candles[i - 1]
                   c2 = candles[i]
 
-                  # ----------------------------------
-                  # BULLISH FVG
-                  # ----------------------------------
-
                   if mss["type"] == "BULLISH MSS":
-
                       if c2["low"] > c0["high"]:
-
                           return {
                               "type": "BULLISH FVG",
                               "index": i,
@@ -462,14 +295,8 @@ jobs:
                               "time": c2["datetime"]
                           }
 
-                  # ----------------------------------
-                  # BEARISH FVG
-                  # ----------------------------------
-
                   if mss["type"] == "BEARISH MSS":
-
                       if c2["high"] < c0["low"]:
-
                           return {
                               "type": "BEARISH FVG",
                               "index": i,
@@ -480,12 +307,7 @@ jobs:
 
               return None
 
-          # ==========================================
-          # LONG-TERM TREND
-          # ==========================================
-
           def determine_trend(candles):
-
               closes = [
                   candle["close"]
                   for candle in candles
@@ -515,23 +337,15 @@ jobs:
 
               s100 = sma100[-1]
               s200 = sma200[-1]
-
               r100 = rma100[-1]
               r200 = rma200[-1]
 
-              if None in [
-                  s100,
-                  s200,
-                  r100,
-                  r200
-              ]:
-
+              if None in [s100, s200, r100, r200]:
                   return None
 
               bullish_score = 0
               bearish_score = 0
 
-              # Price vs averages
               if current > s100:
                   bullish_score += 1
 
@@ -542,6 +356,12 @@ jobs:
                   bullish_score += 1
 
               if current > r200:
+                  bullish_score += 1
+
+              if s100 > s200:
+                  bullish_score += 1
+
+              if r100 > r200:
                   bullish_score += 1
 
               if current < s100:
@@ -556,13 +376,6 @@ jobs:
               if current < r200:
                   bearish_score += 1
 
-              # Average alignment
-              if s100 > s200:
-                  bullish_score += 1
-
-              if r100 > r200:
-                  bullish_score += 1
-
               if s100 < s200:
                   bearish_score += 1
 
@@ -570,15 +383,10 @@ jobs:
                   bearish_score += 1
 
               if bullish_score >= 5:
-
                   trend = "LONG-TERM BULLISH"
-
               elif bearish_score >= 5:
-
                   trend = "LONG-TERM BEARISH"
-
               else:
-
                   trend = "LONG-TERM NEUTRAL"
 
               return {
@@ -591,12 +399,7 @@ jobs:
                   "rma200": r200
               }
 
-          # ==========================================
-          # PRICE FORMAT
-          # ==========================================
-
           def decimals(symbol):
-
               if symbol == "XAU/USD":
                   return 2
 
@@ -606,17 +409,10 @@ jobs:
               return 5
 
           def fmt(symbol, value):
-
               if value is None:
                   return "N/A"
 
-              return (
-                  f"{value:.{decimals(symbol)}f}"
-              )
-
-          # ==========================================
-          # CREATE TRADE PLAN
-          # ==========================================
+              return f"{value:.{decimals(symbol)}f}"
 
           def create_trade_plan(
               symbol,
@@ -626,7 +422,6 @@ jobs:
               fvg,
               trend_data
           ):
-
               current = candles[-1]["close"]
 
               atr = calculate_atr(
@@ -637,13 +432,7 @@ jobs:
               if atr is None:
                   return None
 
-              direction = mss["type"]
-
-              # ======================================
-              # BULLISH
-              # ======================================
-
-              if direction == "BULLISH MSS":
+              if mss["type"] == "BULLISH MSS":
 
                   entry = (
                       fvg["low"] +
@@ -652,8 +441,7 @@ jobs:
 
                   stop_loss = (
                       sweep["liquidity"]
-                      -
-                      atr * SL_ATR_MULTIPLIER
+                      - atr * SL_ATR_MULTIPLIER
                   )
 
                   risk = entry - stop_loss
@@ -676,26 +464,13 @@ jobs:
                       <= current
                       <= fvg["high"]
                   ):
-
-                      entry_status = (
-                          "🔥 SNIPER ENTRY NOW"
-                      )
+                      entry_status = "🔥 SNIPER ENTRY NOW"
 
                   elif current < fvg["low"]:
-
-                      entry_status = (
-                          "⏳ WAIT FOR BULLISH FVG RETEST"
-                      )
+                      entry_status = "⏳ WAIT FOR BULLISH FVG RETEST"
 
                   else:
-
-                      entry_status = (
-                          "⚠️ PRICE ABOVE FVG - DO NOT CHASE"
-                      )
-
-              # ======================================
-              # BEARISH
-              # ======================================
+                      entry_status = "⚠️ PRICE ABOVE FVG - DO NOT CHASE"
 
               else:
 
@@ -706,8 +481,7 @@ jobs:
 
                   stop_loss = (
                       sweep["liquidity"]
-                      +
-                      atr * SL_ATR_MULTIPLIER
+                      + atr * SL_ATR_MULTIPLIER
                   )
 
                   risk = stop_loss - entry
@@ -730,32 +504,434 @@ jobs:
                       <= current
                       <= fvg["high"]
                   ):
-
-                      entry_status = (
-                          "🔥 SNIPER ENTRY NOW"
-                      )
+                      entry_status = "🔥 SNIPER ENTRY NOW"
 
                   elif current > fvg["high"]:
-
-                      entry_status = (
-                          "⏳ WAIT FOR BEARISH FVG RETEST"
-                      )
+                      entry_status = "⏳ WAIT FOR BEARISH FVG RETEST"
 
                   else:
-
-                      entry_status = (
-                          "⚠️ PRICE BELOW FVG - DO NOT CHASE"
-                      )
-
-              # ======================================
-              # SETUP GRADE
-              # ======================================
+                      entry_status = "⚠️ PRICE BELOW FVG - DO NOT CHASE"
 
               if (
                   aligned
                   and
-                  entry_status ==
-                  "🔥 SNIPER ENTRY NOW"
+                  entry_status == "🔥 SNIPER ENTRY NOW"
               ):
+                  setup_grade = "A+ SNIPER"
 
-                 
+              elif aligned:
+                  setup_grade = "A - HIGH QUALITY"
+
+              elif entry_status == "🔥 SNIPER ENTRY NOW":
+                  setup_grade = "B - COUNTER TREND"
+
+              else:
+                  setup_grade = "WAIT"
+
+              return {
+                  "direction": mss["type"],
+                  "entry": entry,
+                  "stop_loss": stop_loss,
+                  "tp1": tp1,
+                  "tp2": tp2,
+                  "tp3": tp3,
+                  "tp4": tp4,
+                  "risk": risk,
+                  "atr": atr,
+                  "aligned": aligned,
+                  "entry_status": entry_status,
+                  "setup_grade": setup_grade
+              }
+
+          def scan_market(symbol, candles):
+
+              print()
+              print("================================")
+              print("MARKET:", symbol)
+              print("================================")
+
+              if len(candles) < 250:
+                  print("❌ Not enough candles")
+                  return
+
+              candles = candles[1:]
+
+              trend_data = determine_trend(candles)
+
+              if not trend_data:
+                  print("❌ Trend calculation failed")
+                  return
+
+              print()
+              print("📊 LONG-TERM TREND")
+              print("Trend:", trend_data["trend"])
+              print(
+                  "Bullish:",
+                  trend_data["bullish_score"],
+                  "/ 6"
+              )
+              print(
+                  "Bearish:",
+                  trend_data["bearish_score"],
+                  "/ 6"
+              )
+              print(
+                  "SMA100:",
+                  fmt(symbol, trend_data["sma100"])
+              )
+              print(
+                  "SMA200:",
+                  fmt(symbol, trend_data["sma200"])
+              )
+              print(
+                  "RMA100:",
+                  fmt(symbol, trend_data["rma100"])
+              )
+              print(
+                  "RMA200:",
+                  fmt(symbol, trend_data["rma200"])
+              )
+
+              swing_highs, swing_lows = (
+                  find_liquidity(candles)
+              )
+
+              print()
+              print(
+                  "Swing highs:",
+                  len(swing_highs)
+              )
+              print(
+                  "Swing lows:",
+                  len(swing_lows)
+              )
+
+              sweeps = find_sweep(
+                  candles,
+                  swing_highs,
+                  swing_lows
+              )
+
+              if not sweeps:
+                  print("STATUS: NO LIQUIDITY SWEEP")
+                  return
+
+              sweep = sweeps[-1]
+
+              print()
+              print("🔥 LIQUIDITY SWEEP")
+              print("Direction:", sweep["type"])
+              print(
+                  "Liquidity:",
+                  fmt(symbol, sweep["liquidity"])
+              )
+              print("Time:", sweep["time"])
+
+              mss = find_structure_break(
+                  candles,
+                  sweep,
+                  swing_highs,
+                  swing_lows
+              )
+
+              if not mss:
+                  print("STATUS: SWEEP FOUND - NO MSS")
+                  return
+
+              print()
+              print("🔥 MSS / CHOCH")
+              print("Type:", mss["type"])
+              print(
+                  "Break:",
+                  fmt(symbol, mss["level"])
+              )
+              print("Time:", mss["time"])
+
+              fvg = find_fvg(
+                  candles,
+                  mss
+              )
+
+              if not fvg:
+                  print("STATUS: MSS FOUND - NO FVG")
+                  return
+
+              print()
+              print("🔥 FVG")
+              print("Type:", fvg["type"])
+              print(
+                  "Low:",
+                  fmt(symbol, fvg["low"])
+              )
+              print(
+                  "High:",
+                  fmt(symbol, fvg["high"])
+              )
+
+              trade = create_trade_plan(
+                  symbol,
+                  candles,
+                  sweep,
+                  mss,
+                  fvg,
+                  trend_data
+              )
+
+              if not trade:
+                  print("❌ Invalid trade geometry")
+                  return
+
+              current = candles[-1]["close"]
+
+              print()
+              print("================================")
+              print("🚨 TRADE PLAN")
+              print("================================")
+              print("Market:", symbol)
+              print("Direction:", trade["direction"])
+              print(
+                  "Trend:",
+                  trend_data["trend"]
+              )
+              print(
+                  "Trend aligned:",
+                  "YES ✅"
+                  if trade["aligned"]
+                  else "NO ❌"
+              )
+              print()
+              print(
+                  "ENTRY:",
+                  fmt(symbol, trade["entry"])
+              )
+              print(
+                  "SL:",
+                  fmt(symbol, trade["stop_loss"])
+              )
+              print(
+                  "TP1 1R:",
+                  fmt(symbol, trade["tp1"])
+              )
+              print(
+                  "TP2 2R:",
+                  fmt(symbol, trade["tp2"])
+              )
+              print(
+                  "TP3 3R:",
+                  fmt(symbol, trade["tp3"])
+              )
+              print(
+                  "TP4 4R:",
+                  fmt(symbol, trade["tp4"])
+              )
+              print(
+                  "ATR:",
+                  fmt(symbol, trade["atr"])
+              )
+              print(
+                  "Current:",
+                  fmt(symbol, current)
+              )
+              print(
+                  "ENTRY STATUS:",
+                  trade["entry_status"]
+              )
+              print(
+                  "SETUP:",
+                  trade["setup_grade"]
+              )
+
+              sniper = (
+                  trade["aligned"]
+                  and
+                  trade["entry_status"]
+                  == "🔥 SNIPER ENTRY NOW"
+              )
+
+              print()
+              print("================================")
+
+              if sniper:
+                  print("🎯 SNIPER TRADE CONFIRMED")
+                  print(
+                      "ENTRY:",
+                      fmt(symbol, trade["entry"])
+                  )
+                  print(
+                      "SL:",
+                      fmt(symbol, trade["stop_loss"])
+                  )
+                  print(
+                      "TP1:",
+                      fmt(symbol, trade["tp1"])
+                  )
+                  print(
+                      "TP2:",
+                      fmt(symbol, trade["tp2"])
+                  )
+                  print(
+                      "TP3:",
+                      fmt(symbol, trade["tp3"])
+                  )
+                  print(
+                      "TP4:",
+                      fmt(symbol, trade["tp4"])
+                  )
+              else:
+                  print("⏳ NO SNIPER ENTRY")
+
+              print("================================")
+              print("AUTOMATIC TRADING: DISABLED")
+
+          def request_data():
+
+              for output_size in OUTPUT_SIZES:
+
+                  print(
+                      f"Requesting {output_size} candles..."
+                  )
+
+                  params = {
+                      "symbol": ",".join(SYMBOLS),
+                      "interval": INTERVAL,
+                      "outputsize": output_size,
+                      "apikey": API_KEY
+                  }
+
+                  try:
+
+                      response = requests.get(
+                          URL,
+                          params=params,
+                          timeout=30
+                      )
+
+                      response.raise_for_status()
+
+                      data = response.json()
+
+                      if "code" in data:
+                          print(
+                              "API response:",
+                              data
+                          )
+                          continue
+
+                      print(
+                          "Using:",
+                          output_size,
+                          "candles"
+                      )
+
+                      return data
+
+                  except Exception as error:
+
+                      print(
+                          "Request failed:",
+                          error
+                      )
+
+              raise SystemExit(
+                  "Unable to retrieve market data."
+              )
+
+          data = request_data()
+
+          success = 0
+          failed = 0
+
+          for symbol in SYMBOLS:
+
+              result = data.get(symbol)
+
+              if not result:
+                  print(
+                      f"❌ {symbol}: No response"
+                  )
+                  failed += 1
+                  continue
+
+              if result.get("status") == "error":
+                  print(
+                      f"❌ {symbol}: "
+                      f"{result.get('message', 'Unknown error')}"
+                  )
+                  failed += 1
+                  continue
+
+              values = result.get("values", [])
+
+              if not values:
+                  print(
+                      f"❌ {symbol}: No candles"
+                  )
+                  failed += 1
+                  continue
+
+              candles = []
+
+              for item in values:
+
+                  try:
+
+                      candles.append({
+                          "datetime": item["datetime"],
+                          "open": float(item["open"]),
+                          "high": float(item["high"]),
+                          "low": float(item["low"]),
+                          "close": float(item["close"])
+                      })
+
+                  except Exception:
+                      continue
+
+              if len(candles) < 250:
+
+                  print(
+                      f"❌ {symbol}: "
+                      f"Only {len(candles)} candles"
+                  )
+
+                  failed += 1
+                  continue
+
+              candles.reverse()
+
+              print(
+                  f"✅ {symbol}: "
+                  f"{len(candles)} candles loaded"
+              )
+
+              scan_market(
+                  symbol,
+                  candles
+              )
+
+              success += 1
+
+          print()
+          print("================================")
+          print("STAGE 2 SCAN COMPLETED")
+          print("================================")
+          print(
+              "Successful:",
+              success
+          )
+          print(
+              "Failed:",
+              failed
+          )
+          print(
+              "Timeframe:",
+              INTERVAL
+          )
+          print("Automatic trading: DISABLED")
+          print("================================")
+
+          if success == 0:
+              raise SystemExit(
+                  "No market data was processed."
+              )
+
+          PY
