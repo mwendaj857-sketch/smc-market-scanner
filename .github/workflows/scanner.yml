@@ -13,58 +13,103 @@ jobs:
       - name: Install requests
         run: pip install requests
 
-      - name: Test Telegram connection
+      - name: Test Twelve Data
         env:
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
         run: |
           python - <<'PY'
           import os
           import requests
 
-          token = os.environ["BOT_TOKEN"]
+          API_KEY = os.environ["TWELVE_DATA_API_KEY"]
 
-          api = f"https://api.telegram.org/bot{token}"
+          SYMBOLS = [
+              "EUR/USD",
+              "GBP/USD",
+              "USD/JPY",
+              "USD/CAD",
+              "XAU/USD"
+          ]
 
-          updates = requests.get(
-              f"{api}/getUpdates",
-              timeout=30
-          ).json()
+          url = "https://api.twelvedata.com/time_series"
 
-          messages = updates.get("result", [])
+          params = {
+              "symbol": ",".join(SYMBOLS),
+              "interval": "15min",
+              "outputsize": 10,
+              "apikey": API_KEY
+          }
 
-          if not messages:
-              print("No Telegram message found.")
-              print("Open your bot in Telegram and send /start.")
-              raise SystemExit(0)
+          print("Requesting Twelve Data market data...")
+          print("Markets:", ", ".join(SYMBOLS))
+          print("Timeframe: 15min")
+          print()
 
-          message = messages[-1].get("message")
-
-          if not message:
-              print("No message found.")
-              raise SystemExit(0)
-
-          chat_id = message["chat"]["id"]
-
-          text = (
-              "🟢 SMC SCANNER ONLINE\n\n"
-              "Telegram connection: SUCCESS ✅\n"
-              "Market scanner: STARTING\n"
-              "SMC analysis: READY\n"
-              "News engine: READY\n"
-              "Trade execution: DISABLED 🚫\n\n"
-              "Next stage: market scanning."
-          )
-
-          response = requests.post(
-              f"{api}/sendMessage",
-              json={
-                  "chat_id": chat_id,
-                  "text": text
-              },
+          response = requests.get(
+              url,
+              params=params,
               timeout=30
           )
+
+          print("HTTP status:", response.status_code)
 
           response.raise_for_status()
 
-          print("Telegram test notification sent successfully.")
+          data = response.json()
+
+          if "code" in data:
+              print("Twelve Data error:")
+              print(data)
+              raise SystemExit(1)
+
+          success = 0
+          failed = 0
+
+          for symbol in SYMBOLS:
+
+              result = data.get(symbol)
+
+              if not result:
+                  print(f"❌ {symbol}: No response")
+                  failed += 1
+                  continue
+
+              if result.get("status") == "error":
+                  print(
+                      f"❌ {symbol}: "
+                      f"{result.get('message', 'Unknown error')}"
+                  )
+                  failed += 1
+                  continue
+
+              values = result.get("values", [])
+
+              if not values:
+                  print(f"❌ {symbol}: No candles returned")
+                  failed += 1
+                  continue
+
+              latest = values[0]
+
+              print(f"✅ {symbol}")
+              print(f"   Time:  {latest.get('datetime')}")
+              print(f"   Open:  {latest.get('open')}")
+              print(f"   High:  {latest.get('high')}")
+              print(f"   Low:   {latest.get('low')}")
+              print(f"   Close: {latest.get('close')}")
+
+              success += 1
+
+          print()
+          print("================================")
+          print("Twelve Data test completed")
+          print(f"Successful markets: {success}")
+          print(f"Failed markets: {failed}")
+          print("Automatic trading: DISABLED")
+          print("================================")
+
+          if success == 0:
+              raise SystemExit(
+                  "No market data was successfully retrieved."
+              )
           PY
