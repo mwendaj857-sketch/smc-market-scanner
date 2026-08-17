@@ -20,7 +20,6 @@ jobs:
           python - <<'PY'
           import os
           import requests
-          from math import isnan
 
           API_KEY = os.environ["TWELVE_DATA_API_KEY"]
 
@@ -35,18 +34,15 @@ jobs:
           INTERVAL = "15min"
 
           # ==========================================
-          # CANDLE HISTORY
-          # ==========================================
-
-          # 1000+ candles gives the scanner much more
-          # historical context for the 100/200 MA system.
-          OUTPUT_SIZE = 2000
-
-          URL = "https://api.twelvedata.com/time_series"
-
-          # ==========================================
           # SETTINGS
           # ==========================================
+
+          # Try 2000 first.
+          # If unavailable, automatically try 1000,
+          # then 500.
+          OUTPUT_SIZES = [2000, 1000, 500]
+
+          URL = "https://api.twelvedata.com/time_series"
 
           SMA_FAST = 100
           SMA_SLOW = 200
@@ -56,36 +52,27 @@ jobs:
 
           ATR_PERIOD = 14
 
-          # ATR buffer beyond liquidity sweep
+          # Stop-loss buffer beyond liquidity sweep
           SL_ATR_MULTIPLIER = 0.25
 
-          # Minimum reward required for a setup
-          MIN_RR = 2.0
+          # ==========================================
+          # HEADER
+          # ==========================================
 
           print("================================")
           print("SMC MARKET SCANNER - STAGE 2")
           print("================================")
           print("Timeframe:", INTERVAL)
           print("Markets:", ", ".join(SYMBOLS))
-          print("Candles requested:", OUTPUT_SIZE)
           print("SMA:", SMA_FAST, SMA_SLOW)
           print("RMA:", RMA_FAST, RMA_SLOW)
           print("ATR:", ATR_PERIOD)
-          print("Minimum RR:", MIN_RR)
           print("Automatic trading: DISABLED")
           print()
 
           # ==========================================
-          # MOVING AVERAGES
+          # SMA
           # ==========================================
-
-          def sma(values, period):
-
-              if len(values) < period:
-                  return None
-
-              return sum(values[-period:]) / period
-
 
           def full_sma(values, period):
 
@@ -96,30 +83,17 @@ jobs:
 
               for i in range(period - 1, len(values)):
 
-                  window = values[i - period + 1:i + 1]
+                  window = values[
+                      i - period + 1:i + 1
+                  ]
 
                   result[i] = sum(window) / period
 
               return result
 
-
-          def rma(values, period):
-
-              if len(values) < period:
-                  return None
-
-              # Wilder RMA:
-              # First value = SMA
-              current = sum(values[:period]) / period
-
-              for value in values[period:]:
-
-                  current = (
-                      (current * (period - 1)) + value
-                  ) / period
-
-              return current
-
+          # ==========================================
+          # RMA / WILDER MOVING AVERAGE
+          # ==========================================
 
           def full_rma(values, period):
 
@@ -128,21 +102,24 @@ jobs:
               if len(values) < period:
                   return result
 
-              current = sum(values[:period]) / period
+              current = (
+                  sum(values[:period]) / period
+              )
 
               result[period - 1] = current
 
               for i in range(period, len(values)):
 
                   current = (
-                      (current * (period - 1)) +
-                      values[i]
+                      (
+                          current * (period - 1)
+                      )
+                      + values[i]
                   ) / period
 
                   result[i] = current
 
               return result
-
 
           # ==========================================
           # ATR
@@ -159,7 +136,7 @@ jobs:
 
                   high = candles[i]["high"]
                   low = candles[i]["low"]
-                  previous_close = candles[i-1]["close"]
+                  previous_close = candles[i - 1]["close"]
 
                   tr = max(
                       high - low,
@@ -172,59 +149,79 @@ jobs:
               if len(true_ranges) < period:
                   return None
 
-              # Wilder-style ATR
-              atr_value = sum(
-                  true_ranges[:period]
-              ) / period
+              atr_value = (
+                  sum(true_ranges[:period]) / period
+              )
 
               for tr in true_ranges[period:]:
 
                   atr_value = (
-                      (atr_value * (period - 1)) + tr
+                      (
+                          atr_value * (period - 1)
+                      ) + tr
                   ) / period
 
               return atr_value
 
-
           # ==========================================
-          # SWING DETECTION
+          # SWING HIGH
           # ==========================================
 
-          def is_swing_high(candles, i, strength=2):
+          def is_swing_high(
+              candles,
+              i,
+              strength=2
+          ):
 
-              if i < strength or i >= len(candles) - strength:
+              if (
+                  i < strength
+                  or i >= len(candles) - strength
+              ):
                   return False
 
               high = candles[i]["high"]
 
               for j in range(1, strength + 1):
 
-                  if high <= candles[i-j]["high"]:
+                  if high <= candles[i - j]["high"]:
                       return False
 
-                  if high <= candles[i+j]["high"]:
+                  if high <= candles[i + j]["high"]:
                       return False
 
               return True
 
+          # ==========================================
+          # SWING LOW
+          # ==========================================
 
-          def is_swing_low(candles, i, strength=2):
+          def is_swing_low(
+              candles,
+              i,
+              strength=2
+          ):
 
-              if i < strength or i >= len(candles) - strength:
+              if (
+                  i < strength
+                  or i >= len(candles) - strength
+              ):
                   return False
 
               low = candles[i]["low"]
 
               for j in range(1, strength + 1):
 
-                  if low >= candles[i-j]["low"]:
+                  if low >= candles[i - j]["low"]:
                       return False
 
-                  if low >= candles[i+j]["low"]:
+                  if low >= candles[i + j]["low"]:
                       return False
 
               return True
 
+          # ==========================================
+          # FIND LIQUIDITY
+          # ==========================================
 
           def find_liquidity(candles):
 
@@ -254,7 +251,6 @@ jobs:
 
               return swing_highs, swing_lows
 
-
           # ==========================================
           # LIQUIDITY SWEEP
           # ==========================================
@@ -276,52 +272,63 @@ jobs:
 
                   candle = candles[i]
 
-                  # ==================================
+                  # ----------------------------------
                   # BEARISH SWEEP
-                  # ==================================
+                  # Takes buy-side liquidity
+                  # and closes back below.
+                  # ----------------------------------
 
                   for level in reversed(swing_highs):
 
                       if level["index"] >= i:
                           continue
 
-                      if candle["high"] > level["price"]:
+                      if (
+                          candle["high"]
+                          > level["price"]
+                          and
+                          candle["close"]
+                          < level["price"]
+                      ):
 
-                          if candle["close"] < level["price"]:
+                          sweeps.append({
+                              "type": "BEARISH",
+                              "index": i,
+                              "liquidity": level["price"],
+                              "time": candle["datetime"]
+                          })
 
-                              sweeps.append({
-                                  "type": "BEARISH",
-                                  "index": i,
-                                  "liquidity": level["price"],
-                                  "time": candle["datetime"]
-                              })
+                          break
 
-                              break
-
-                  # ==================================
+                  # ----------------------------------
                   # BULLISH SWEEP
-                  # ==================================
+                  # Takes sell-side liquidity
+                  # and closes back above.
+                  # ----------------------------------
 
                   for level in reversed(swing_lows):
 
                       if level["index"] >= i:
                           continue
 
-                      if candle["low"] < level["price"]:
+                      if (
+                          candle["low"]
+                          < level["price"]
+                          and
+                          candle["close"]
+                          > level["price"]
+                      ):
 
-                          if candle["close"] > level["price"]:
+                          sweeps.append({
+                              "type": "BULLISH",
+                              "index": i,
+                              "liquidity": level["price"],
+                              "time": candle["datetime"]
+                          })
 
-                              sweeps.append({
-                                  "type": "BULLISH",
-                                  "index": i,
-                                  "liquidity": level["price"],
-                                  "time": candle["datetime"]
-                              })
-
-                              break
+                          break
 
               return sweeps
-
 
           # ==========================================
           # MSS / CHOCH
@@ -342,14 +349,15 @@ jobs:
                   sweep_index + 11
               )
 
-              # ======================================
+              # --------------------------------------
               # BULLISH MSS
-              # ======================================
+              # --------------------------------------
 
               if direction == "BULLISH":
 
                   previous_highs = [
-                      x for x in swing_highs
+                      x
+                      for x in swing_highs
                       if x["index"] < sweep_index
                   ]
 
@@ -363,7 +371,10 @@ jobs:
                       search_end
                   ):
 
-                      if candles[i]["close"] > target["price"]:
+                      if (
+                          candles[i]["close"]
+                          > target["price"]
+                      ):
 
                           return {
                               "type": "BULLISH MSS",
@@ -372,14 +383,15 @@ jobs:
                               "time": candles[i]["datetime"]
                           }
 
-              # ======================================
+              # --------------------------------------
               # BEARISH MSS
-              # ======================================
+              # --------------------------------------
 
               if direction == "BEARISH":
 
                   previous_lows = [
-                      x for x in swing_lows
+                      x
+                      for x in swing_lows
                       if x["index"] < sweep_index
                   ]
 
@@ -393,7 +405,10 @@ jobs:
                       search_end
                   ):
 
-                      if candles[i]["close"] < target["price"]:
+                      if (
+                          candles[i]["close"]
+                          < target["price"]
+                      ):
 
                           return {
                               "type": "BEARISH MSS",
@@ -404,9 +419,8 @@ jobs:
 
               return None
 
-
           # ==========================================
-          # FAIR VALUE GAP
+          # FIND FVG
           # ==========================================
 
           def find_fvg(candles, mss):
@@ -428,13 +442,13 @@ jobs:
                   if i < 2:
                       continue
 
-                  c0 = candles[i-2]
-                  c1 = candles[i-1]
+                  c0 = candles[i - 2]
+                  c1 = candles[i - 1]
                   c2 = candles[i]
 
-                  # ==================================
+                  # ----------------------------------
                   # BULLISH FVG
-                  # ==================================
+                  # ----------------------------------
 
                   if mss["type"] == "BULLISH MSS":
 
@@ -448,9 +462,9 @@ jobs:
                               "time": c2["datetime"]
                           }
 
-                  # ==================================
+                  # ----------------------------------
                   # BEARISH FVG
-                  # ==================================
+                  # ----------------------------------
 
                   if mss["type"] == "BEARISH MSS":
 
@@ -458,114 +472,102 @@ jobs:
 
                           return {
                               "type": "BEARISH FVG",
+                              "index": i,
                               "low": c2["high"],
                               "high": c0["low"],
-                              "index": i,
                               "time": c2["datetime"]
                           }
 
               return None
 
-
           # ==========================================
-          # TREND ENGINE
+          # LONG-TERM TREND
           # ==========================================
 
           def determine_trend(candles):
 
               closes = [
-                  x["close"]
-                  for x in candles
+                  candle["close"]
+                  for candle in candles
               ]
 
-              sma100_series = full_sma(
+              sma100 = full_sma(
                   closes,
                   SMA_FAST
               )
 
-              sma200_series = full_sma(
+              sma200 = full_sma(
                   closes,
                   SMA_SLOW
               )
 
-              rma100_series = full_rma(
+              rma100 = full_rma(
                   closes,
                   RMA_FAST
               )
 
-              rma200_series = full_rma(
+              rma200 = full_rma(
                   closes,
                   RMA_SLOW
               )
 
               current = closes[-1]
 
-              sma100 = sma100_series[-1]
-              sma200 = sma200_series[-1]
+              s100 = sma100[-1]
+              s200 = sma200[-1]
 
-              rma100 = rma100_series[-1]
-              rma200 = rma200_series[-1]
+              r100 = rma100[-1]
+              r200 = rma200[-1]
 
               if None in [
-                  sma100,
-                  sma200,
-                  rma100,
-                  rma200
+                  s100,
+                  s200,
+                  r100,
+                  r200
               ]:
 
                   return None
 
-              # ======================================
-              # STRONG LONG TERM BULLISH
-              # ======================================
-
               bullish_score = 0
-
-              if current > sma100:
-                  bullish_score += 1
-
-              if current > sma200:
-                  bullish_score += 1
-
-              if current > rma100:
-                  bullish_score += 1
-
-              if current > rma200:
-                  bullish_score += 1
-
-              if sma100 > sma200:
-                  bullish_score += 1
-
-              if rma100 > rma200:
-                  bullish_score += 1
-
-              # ======================================
-              # STRONG LONG TERM BEARISH
-              # ======================================
-
               bearish_score = 0
 
-              if current < sma100:
+              # Price vs averages
+              if current > s100:
+                  bullish_score += 1
+
+              if current > s200:
+                  bullish_score += 1
+
+              if current > r100:
+                  bullish_score += 1
+
+              if current > r200:
+                  bullish_score += 1
+
+              if current < s100:
                   bearish_score += 1
 
-              if current < sma200:
+              if current < s200:
                   bearish_score += 1
 
-              if current < rma100:
+              if current < r100:
                   bearish_score += 1
 
-              if current < rma200:
+              if current < r200:
                   bearish_score += 1
 
-              if sma100 < sma200:
+              # Average alignment
+              if s100 > s200:
+                  bullish_score += 1
+
+              if r100 > r200:
+                  bullish_score += 1
+
+              if s100 < s200:
                   bearish_score += 1
 
-              if rma100 < rma200:
+              if r100 < r200:
                   bearish_score += 1
-
-              # ======================================
-              # CLASSIFICATION
-              # ======================================
 
               if bullish_score >= 5:
 
@@ -583,15 +585,14 @@ jobs:
                   "trend": trend,
                   "bullish_score": bullish_score,
                   "bearish_score": bearish_score,
-                  "sma100": sma100,
-                  "sma200": sma200,
-                  "rma100": rma100,
-                  "rma200": rma200
+                  "sma100": s100,
+                  "sma200": s200,
+                  "rma100": r100,
+                  "rma200": r200
               }
 
-
           # ==========================================
-          # PRICE ROUNDING
+          # PRICE FORMAT
           # ==========================================
 
           def decimals(symbol):
@@ -604,19 +605,17 @@ jobs:
 
               return 5
 
-
           def fmt(symbol, value):
 
               if value is None:
                   return "N/A"
 
-              d = decimals(symbol)
-
-              return f"{value:.{d}f}"
-
+              return (
+                  f"{value:.{decimals(symbol)}f}"
+              )
 
           # ==========================================
-          # TRADE PLAN
+          # CREATE TRADE PLAN
           # ==========================================
 
           def create_trade_plan(
@@ -641,18 +640,19 @@ jobs:
               direction = mss["type"]
 
               # ======================================
-              # BULLISH TRADE
+              # BULLISH
               # ======================================
 
               if direction == "BULLISH MSS":
 
                   entry = (
-                      fvg["low"] + fvg["high"]
+                      fvg["low"] +
+                      fvg["high"]
                   ) / 2
 
-                  # SL below sweep liquidity
                   stop_loss = (
-                      sweep["liquidity"] -
+                      sweep["liquidity"]
+                      -
                       atr * SL_ATR_MULTIPLIER
                   )
 
@@ -661,22 +661,21 @@ jobs:
                   if risk <= 0:
                       return None
 
-                  tp1 = entry + risk * 1
+                  tp1 = entry + risk
                   tp2 = entry + risk * 2
                   tp3 = entry + risk * 3
                   tp4 = entry + risk * 4
 
-                  rr1 = 1.0
-                  rr2 = 2.0
-                  rr3 = 3.0
-                  rr4 = 4.0
-
                   aligned = (
-                      trend_data["trend"] ==
-                      "LONG-TERM BULLISH"
+                      trend_data["trend"]
+                      == "LONG-TERM BULLISH"
                   )
 
-                  if fvg["low"] <= current <= fvg["high"]:
+                  if (
+                      fvg["low"]
+                      <= current
+                      <= fvg["high"]
+                  ):
 
                       entry_status = (
                           "🔥 SNIPER ENTRY NOW"
@@ -695,18 +694,19 @@ jobs:
                       )
 
               # ======================================
-              # BEARISH TRADE
+              # BEARISH
               # ======================================
 
               else:
 
                   entry = (
-                      fvg["low"] + fvg["high"]
+                      fvg["low"] +
+                      fvg["high"]
                   ) / 2
 
-                  # SL above sweep liquidity
                   stop_loss = (
-                      sweep["liquidity"] +
+                      sweep["liquidity"]
+                      +
                       atr * SL_ATR_MULTIPLIER
                   )
 
@@ -715,22 +715,21 @@ jobs:
                   if risk <= 0:
                       return None
 
-                  tp1 = entry - risk * 1
+                  tp1 = entry - risk
                   tp2 = entry - risk * 2
                   tp3 = entry - risk * 3
                   tp4 = entry - risk * 4
 
-                  rr1 = 1.0
-                  rr2 = 2.0
-                  rr3 = 3.0
-                  rr4 = 4.0
-
                   aligned = (
-                      trend_data["trend"] ==
-                      "LONG-TERM BEARISH"
+                      trend_data["trend"]
+                      == "LONG-TERM BEARISH"
                   )
 
-                  if fvg["low"] <= current <= fvg["high"]:
+                  if (
+                      fvg["low"]
+                      <= current
+                      <= fvg["high"]
+                  ):
 
                       entry_status = (
                           "🔥 SNIPER ENTRY NOW"
@@ -749,15 +748,14 @@ jobs:
                       )
 
               # ======================================
-              # SETUP QUALITY
+              # SETUP GRADE
               # ======================================
 
-              if aligned and entry_status == "🔥 SNIPER ENTRY NOW":
+              if (
+                  aligned
+                  and
+                  entry_status ==
+                  "🔥 SNIPER ENTRY NOW"
+              ):
 
-                  setup_grade = "A+ SNIPER"
-
-              elif aligned:
-
-                  setup_grade = "A - HIGH QUALITY"
-
-              elif entry_
+                 
