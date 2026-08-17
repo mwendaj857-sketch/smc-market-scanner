@@ -33,7 +33,7 @@ jobs:
           ]
 
           INTERVAL = "15min"
-          OUTPUT_SIZE = 100
+          OUTPUT_SIZE = 500
 
           URL = "https://api.twelvedata.com/time_series"
 
