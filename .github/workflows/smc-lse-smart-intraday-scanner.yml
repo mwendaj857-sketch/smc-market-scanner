@@ -1,0 +1,613 @@
+name: SMC 9-Method LSE Smart Intraday Scanner
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/5 * * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install lse-data pandas numpy
+
+      - name: Run scanner
+        env:
+          LSE_API_KEY: ${{ secrets.LSE_API_KEY }}
+          PYTHONUNBUFFERED: "1"
+        run: |
+          python - <<'PY'
+          import os
+          import math
+          import traceback
+          from datetime import datetime, timezone
+
+          import numpy as np
+          import pandas as pd
+
+          try:
+              from lse import LSE
+          except Exception as exc:
+              raise SystemExit(f"FATAL: lse-data import failed: {exc}")
+
+          API_KEY = os.getenv("LSE_API_KEY", "").strip()
+          if not API_KEY:
+              raise SystemExit("FATAL: LSE_API_KEY secret is missing.")
+
+          PAIRS = [
+              "EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF", "USD/CAD",
+              "AUD/USD", "NZD/USD", "EUR/GBP", "EUR/JPY", "EUR/CHF",
+              "EUR/AUD", "EUR/CAD", "GBP/JPY", "GBP/CHF", "GBP/AUD",
+              "GBP/CAD", "AUD/JPY", "AUD/NZD", "CAD/JPY", "NZD/JPY",
+          ]
+
+          # Strategy hierarchy:
+          # 1D = context, 4H = controlling regime, 1H = decision,
+          # 30M = setup, 15M = confirmation, 5M = trigger.
+          TIMEFRAMES = {
+              "1D": {"api": "1d", "bars": 700},
+              "4H": {"api": "4h", "bars": 1200},
+              "1H": {"api": "1h", "bars": 1800},
+              # LSE documentation currently lists 5M, 15M, 1H, 4H and Daily.
+              # 30M is therefore built locally from CLOSED 15M candles.
+              "30M": {"api": "15m", "bars": 4800},
+              "15M": {"api": "15m", "bars": 3000},
+              "5M": {"api": "5m", "bars": 4000},
+          }
+
+          # The LSE REST API returns up to 5,000 rows/request; this scanner stays
+          # below that and derives 30M from completed 15M candles rather than
+          # assuming an undocumented/native 30M endpoint.
+          MIN_ROWS = 120
+          MIN_RR = 2.0
+          TOP_N = 5
+          SCORE_THRESHOLD = 68.0
+
+          def clean_df(raw):
+              if raw is None:
+                  return None
+              if isinstance(raw, tuple):
+                  raw = raw[0]
+              if not isinstance(raw, pd.DataFrame):
+                  raw = pd.DataFrame(raw)
+              if raw.empty:
+                  return None
+
+              df = raw.copy()
+              rename = {}
+              for c in df.columns:
+                  k = str(c).strip().lower()
+                  if k in ("timestamp", "time", "datetime", "date", "t"):
+                      rename[c] = "time"
+                  elif k in ("open", "o"):
+                      rename[c] = "open"
+                  elif k in ("high", "h"):
+                      rename[c] = "high"
+                  elif k in ("low", "l"):
+                      rename[c] = "low"
+                  elif k in ("close", "c", "price"):
+                      rename[c] = "close"
+                  elif k in ("volume", "v"):
+                      rename[c] = "volume"
+              df = df.rename(columns=rename)
+
+              required = ["time", "open", "high", "low", "close"]
+              if not all(c in df.columns for c in required):
+                  raise ValueError(
+                      f"Missing OHLC/time fields. Got columns: {list(df.columns)}"
+                  )
+
+              ts = pd.to_datetime(df["time"], utc=True, errors="coerce")
+              df["time"] = ts
+              for c in ["open", "high", "low", "close"]:
+                  df[c] = pd.to_numeric(df[c], errors="coerce")
+              df = (
+                  df.dropna(subset=required)
+                    .drop_duplicates(subset=["time"])
+                    .sort_values("time")
+                    .reset_index(drop=True)
+              )
+              if len(df) < MIN_ROWS:
+                  return None
+              return df
+
+          def fetch(client, symbol, api_tf, bars):
+              # The official client supports client.candles(symbol, resolution, ...).
+              # Request enough history for the indicators; the client/provider may
+              # return fewer rows for a newly listed/limited instrument.
+              raw = client.candles(symbol, api_tf)
+              df = clean_df(raw)
+              if df is None:
+                  return None
+              return df.tail(bars).reset_index(drop=True)
+
+          def build_30m_from_15m(df15):
+              """Build 30M OHLC candles from completed 15M candles only."""
+              if df15 is None or df15.empty:
+                  return None
+              x = df15.copy().set_index("time").sort_index()
+              # UTC-aligned 30-minute buckets.
+              out = x.resample("30min", label="left", closed="left").agg({
+                  "open": "first",
+                  "high": "max",
+                  "low": "min",
+                  "close": "last",
+                  "volume": "sum" if "volume" in x.columns else "first",
+              }).dropna(subset=["open", "high", "low", "close"]).reset_index()
+              return out
+
+          def remove_open_bar(df, tf):
+              # Never use the currently forming candle. We estimate the current
+              # bucket from UTC time and drop the latest bucket if it has not closed.
+              if df is None or df.empty:
+                  return df
+              minutes = {"5M": 5, "15M": 15, "30M": 30, "1H": 60, "4H": 240}
+              if tf == "1D":
+                  freq_min = 1440
+              else:
+                  freq_min = minutes[tf]
+              last = df.iloc[-1]["time"]
+              now = pd.Timestamp.now(tz="UTC")
+              elapsed = (now - last).total_seconds() / 60.0
+              # If the timestamp represents the opening of the latest bar,
+              # a bar is considered closed after its full interval.
+              if elapsed < freq_min:
+                  return df.iloc[:-1].copy()
+              return df
+
+          def ema(s, n):
+              return s.ewm(span=n, adjust=False).mean()
+
+          def rsi(s, n=14):
+              d = s.diff()
+              up = d.clip(lower=0)
+              dn = -d.clip(upper=0)
+              au = up.ewm(alpha=1/n, adjust=False).mean()
+              ad = dn.ewm(alpha=1/n, adjust=False).mean()
+              rs = au / ad.replace(0, np.nan)
+              out = 100 - (100 / (1 + rs))
+              return out.fillna(50)
+
+          def atr(df, n=14):
+              pc = df["close"].shift(1)
+              tr = pd.concat([
+                  df["high"] - df["low"],
+                  (df["high"] - pc).abs(),
+                  (df["low"] - pc).abs(),
+              ], axis=1).max(axis=1)
+              return tr.ewm(alpha=1/n, adjust=False).mean()
+
+          def macd(s):
+              m = ema(s, 12) - ema(s, 26)
+              sig = ema(m, 9)
+              return m, sig, m - sig
+
+          def fib_location(df, lookback=100):
+              x = df.tail(lookback)
+              hi = float(x["high"].max())
+              lo = float(x["low"].min())
+              close = float(x["close"].iloc[-1])
+              rng = hi - lo
+              if rng <= 0:
+                  return 0.5, hi, lo
+              return (close - lo) / rng, hi, lo
+
+          def structure(df, lookback=20):
+              x = df.tail(max(lookback * 3, 60))
+              if len(x) < lookback * 2:
+                  return 0, "INSUFFICIENT"
+              prev = x.iloc[-lookback*2:-lookback]
+              cur = x.iloc[-lookback:]
+              ph, pl = prev["high"].max(), prev["low"].min()
+              ch, cl = cur["high"].max(), cur["low"].min()
+              if ch > ph and cl > pl:
+                  return 1, "BULLISH HH+HL"
+              if ch < ph and cl < pl:
+                  return -1, "BEARISH LH+LL"
+              return 0, "MIXED"
+
+          def liquidity_sweep(df, direction):
+              if len(df) < 25:
+                  return False
+              x = df.tail(25)
+              prev = x.iloc[:-1]
+              last = x.iloc[-1]
+              recent_high = prev["high"].max()
+              recent_low = prev["low"].min()
+              if direction > 0:
+                  return bool(last["low"] < recent_low and last["close"] > recent_low)
+              return bool(last["high"] > recent_high and last["close"] < recent_high)
+
+          def candle_impulse(df, direction):
+              if len(df) < 3:
+                  return False
+              a = df.iloc[-2]
+              b = df.iloc[-1]
+              rng = max(float(b["high"] - b["low"]), 1e-12)
+              body = abs(float(b["close"] - b["open"]))
+              if direction > 0:
+                  return b["close"] > b["open"] and body / rng >= 0.55
+              return b["close"] < b["open"] and body / rng >= 0.55
+
+          def analyze(df, label, forced_direction=None):
+              df = df.copy()
+              df["ema20"] = ema(df["close"], 20)
+              df["ema50"] = ema(df["close"], 50)
+              df["rsi"] = rsi(df["close"])
+              m, ms, mh = macd(df["close"])
+              df["macd"] = m
+              df["macd_sig"] = ms
+              df["atr"] = atr(df)
+              d, st = structure(df)
+
+              last = df.iloc[-1]
+              loc, hi, lo = fib_location(df)
+              trend = 1 if last["ema20"] > last["ema50"] else -1
+              ind = 1 if (last["rsi"] >= 50 and last["macd"] >= last["macd_sig"]) else -1
+              if last["rsi"] < 50 and last["macd"] < last["macd_sig"]:
+                  ind = -1
+
+              direction = forced_direction if forced_direction in (1, -1) else (
+                  d if d != 0 else trend
+              )
+
+              score = 0.0
+              reasons = []
+
+              if d == direction:
+                  score += 15
+                  reasons.append(f"Market Structure: {st} (+15)")
+              elif d == 0:
+                  reasons.append("Market Structure: mixed (+0)")
+              else:
+                  reasons.append("Market Structure: opposing (-8)")
+                  score -= 8
+
+              if trend == direction:
+                  score += 10
+                  reasons.append("Trend: EMA20/EMA50 aligned (+10)")
+              else:
+                  reasons.append("Trend: EMA alignment conflict (+0)")
+
+              if ind == direction:
+                  score += 5
+                  reasons.append(
+                      f"Indicators: RSI {last['rsi']:.1f} / MACD {last['macd']:.5f} (+5)"
+                  )
+              else:
+                  reasons.append(
+                      f"Indicators: RSI {last['rsi']:.1f} / MACD {last['macd']:.5f} (+0)"
+                  )
+
+              sweep = liquidity_sweep(df, direction)
+              if sweep:
+                  score += 15
+                  reasons.append("Liquidity: directional sweep (+15)")
+              else:
+                  reasons.append("Liquidity: no fresh directional sweep (+0)")
+
+              impulse = candle_impulse(df, direction)
+              if impulse:
+                  score += 10
+                  reasons.append("Price Action: impulse candle (+10)")
+              else:
+                  reasons.append("Price Action: no strong impulse (+0)")
+
+              # Supply/demand proxy: price relative to EMA20 and recent range.
+              sd = (
+                  (direction > 0 and last["close"] >= last["ema20"])
+                  or (direction < 0 and last["close"] <= last["ema20"])
+              )
+              if sd:
+                  score += 10
+                  reasons.append("Supply/Demand: directional zone proxy (+10)")
+              else:
+                  reasons.append("Supply/Demand: not aligned (+0)")
+
+              # Fibonacci is contextual, never a standalone signal.
+              fib_ok = (direction > 0 and 0.25 <= loc <= 0.65) or (
+                  direction < 0 and 0.35 <= loc <= 0.75
+              )
+              if fib_ok:
+                  score += 5
+                  reasons.append(f"Fibonacci: retracement zone ({loc:.3f}) (+5)")
+              else:
+                  reasons.append(f"Fibonacci: not in preferred zone ({loc:.3f}) (+0)")
+
+              return {
+                  "direction": direction,
+                  "structure": st,
+                  "score": max(0.0, min(100.0, score)),
+                  "rsi": float(last["rsi"]),
+                  "macd": float(last["macd"]),
+                  "atr": float(last["atr"]),
+                  "close": float(last["close"]),
+                  "high": hi,
+                  "low": lo,
+                  "reasons": reasons,
+                  "sweep": sweep,
+                  "impulse": impulse,
+              }
+
+          def target_plan(df, direction, entry):
+              a = float(atr(df).iloc[-1])
+              if not math.isfinite(a) or a <= 0:
+                  return None
+
+              x = df.tail(150)
+              if direction > 0:
+                  candidates = sorted(
+                      [float(v) for v in x["high"].nlargest(20).values if v > entry]
+                  )
+              else:
+                  candidates = sorted(
+                      [float(v) for v in x["low"].nsmallest(20).values if v < entry],
+                      reverse=True
+                  )
+
+              # Structural target only. If no legitimate >=2R target exists,
+              # reject instead of inventing/extending TP.
+              sl_distance = max(1.2 * a, 1e-12)
+              sl = entry - sl_distance if direction > 0 else entry + sl_distance
+
+              if direction > 0:
+                  valid = [t for t in candidates if (t - entry) / sl_distance >= MIN_RR]
+                  if not valid:
+                      return None
+                  tp = min(valid)
+              else:
+                  valid = [t for t in candidates if (entry - t) / sl_distance >= MIN_RR]
+                  if not valid:
+                      return None
+                  tp = max(valid)
+
+              rr = (
+                  (tp - entry) / (entry - sl)
+                  if direction > 0 else
+                  (entry - tp) / (sl - entry)
+              )
+              return float(sl), float(tp), float(rr), float(a)
+
+          def wait_reasons(parts):
+              reasons = []
+              if parts["d1"]["direction"] != parts["h4"]["direction"]:
+                  reasons.append("1D context conflicts with the 4H controlling regime.")
+              if parts["h1"]["direction"] != parts["h4"]["direction"]:
+                  reasons.append("1H decision does not confirm the 4H regime.")
+              if parts["m30"]["direction"] != parts["h1"]["direction"]:
+                  reasons.append("30M setup is not aligned with the 1H decision.")
+              if parts["m15"]["direction"] != parts["m30"]["direction"]:
+                  reasons.append("15M confirmation is not aligned with the 30M setup.")
+              if parts["m5"]["direction"] != parts["m15"]["direction"]:
+                  reasons.append("5M trigger has not aligned with the 15M confirmation.")
+              if not parts["m5"]["sweep"] and not parts["m5"]["impulse"]:
+                  reasons.append("5M has no fresh trigger yet; waiting for a sweep or impulse.")
+              if parts.get("rr") is None:
+                  reasons.append("No legitimate structural target currently provides at least 2R.")
+              if parts["h4"]["score"] < 25:
+                  reasons.append("4H regime strength is too weak.")
+              return reasons or ["Waiting for a higher-quality entry condition."]
+
+          client = LSE(api_key=API_KEY)
+          data = {tf: {} for tf in TIMEFRAMES}
+          errors = []
+
+          print("=" * 78)
+          print("SMC 9-METHOD LONDON STRATEGIC EDGE SMART INTRADAY SCANNER")
+          print("=" * 78)
+          print("1D context → 4H regime → 1H decision → 30M setup → 15M confirmation → 5M trigger")
+          print("20 FX pairs | 1D/4H/1H/30M/15M/5M | 30M built from closed 15M | 2R minimum | no max TP")
+          print("Automatic trading: DISABLED")
+          print("")
+
+          native_tfs = ["1D", "4H", "1H", "15M", "5M"]
+
+          for tf in native_tfs:
+              cfg = TIMEFRAMES[tf]
+              print(f"FETCH {tf}: {len(PAIRS)} pairs")
+              for i, pair in enumerate(PAIRS, 1):
+                  try:
+                      df = fetch(client, pair, cfg["api"], cfg["bars"])
+                      df = remove_open_bar(df, tf)
+                      if df is None or len(df) < MIN_ROWS:
+                          errors.append(f"{pair} {tf}: insufficient completed candles")
+                          print(f"  ❌ {pair}: insufficient completed candles")
+                          continue
+                      data[tf][pair] = df
+                      print(f"  ✓ {pair}: {len(df)} completed candles")
+                  except Exception as exc:
+                      errors.append(f"{pair} {tf}: {exc}")
+                      print(f"  ❌ {pair}: {exc}")
+
+          # Build 30M locally from CLOSED 15M candles.
+          print(f"BUILD 30M FROM 15M: {len(PAIRS)} pairs")
+          for pair in PAIRS:
+              try:
+                  df15 = data["15M"].get(pair)
+                  df30 = build_30m_from_15m(df15)
+                  df30 = remove_open_bar(df30, "30M")
+                  if df30 is None or len(df30) < MIN_ROWS:
+                      errors.append(f"{pair} 30M: insufficient completed aggregated candles")
+                      print(f"  ❌ {pair}: insufficient completed 30M candles")
+                      continue
+                  data["30M"][pair] = df30.tail(TIMEFRAMES["30M"]["bars"]).reset_index(drop=True)
+                  print(f"  ✓ {pair}: {len(data['30M'][pair])} completed 30M candles")
+              except Exception as exc:
+                  errors.append(f"{pair} 30M build error: {exc}")
+                  print(f"  ❌ {pair}: 30M build error: {exc}")
+
+          complete_pairs = []
+          for pair in PAIRS:
+              if all(pair in data[tf] for tf in TIMEFRAMES):
+                  complete_pairs.append(pair)
+
+          print("")
+          print(f"DATA QUALITY: {len(complete_pairs)}/{len(PAIRS)} pairs have all 6 timeframes")
+          if errors:
+              print(f"DATA WARNINGS: {len(errors)}")
+
+          results = []
+          waits = []
+
+          for pair in complete_pairs:
+              try:
+                  d1 = analyze(data["1D"][pair], "1D")
+                  h4 = analyze(data["4H"][pair], "4H", forced_direction=d1["direction"])
+                  h1 = analyze(data["1H"][pair], "1H", forced_direction=h4["direction"])
+                  m30 = analyze(data["30M"][pair], "30M", forced_direction=h1["direction"])
+                  m15 = analyze(data["15M"][pair], "15M", forced_direction=m30["direction"])
+                  m5 = analyze(data["5M"][pair], "5M", forced_direction=m15["direction"])
+
+                  # 4H is the controlling regime; lower TFs are confirmation/timing.
+                  alignment = [
+                      d1["direction"] == h4["direction"],
+                      h4["direction"] == h1["direction"],
+                      h1["direction"] == m30["direction"],
+                      m30["direction"] == m15["direction"],
+                      m15["direction"] == m5["direction"],
+                  ]
+                  align_count = sum(alignment)
+
+                  entry = m5["close"]
+                  plan = target_plan(data["5M"][pair], h4["direction"], entry)
+
+                  # Weighted score: higher TFs matter more than the noisy trigger TF.
+                  score = (
+                      d1["score"] * 0.15 +
+                      h4["score"] * 0.25 +
+                      h1["score"] * 0.20 +
+                      m30["score"] * 0.15 +
+                      m15["score"] * 0.15 +
+                      m5["score"] * 0.10
+                  )
+
+                  # Confirmation bonuses/penalties.
+                  if align_count >= 4:
+                      score += 8
+                  elif align_count <= 2:
+                      score -= 10
+
+                  direction = h4["direction"]
+                  qualified = (
+                      d1["direction"] == direction and
+                      h1["direction"] == direction and
+                      m30["direction"] == direction and
+                      m15["direction"] == direction and
+                      m5["direction"] == direction and
+                      plan is not None and
+                      plan[2] >= MIN_RR and
+                      score >= SCORE_THRESHOLD
+                  )
+
+                  result = {
+                      "pair": pair,
+                      "direction": direction,
+                      "score": round(max(0.0, min(100.0, score)), 1),
+                      "align": align_count,
+                      "plan": plan,
+                      "parts": {
+                          "d1": d1, "h4": h4, "h1": h1,
+                          "m30": m30, "m15": m15, "m5": m5
+                      },
+                      "qualified": qualified,
+                  }
+
+                  if qualified:
+                      results.append(result)
+                  else:
+                      waits.append(result)
+              except Exception as exc:
+                  errors.append(f"{pair}: analysis error: {exc}")
+                  print(f"❌ ANALYSIS ERROR {pair}: {exc}")
+                  traceback.print_exc()
+
+          results.sort(key=lambda x: x["score"], reverse=True)
+          waits.sort(key=lambda x: x["score"], reverse=True)
+
+          print("")
+          print("=" * 78)
+          print("🔥 SMC FOREX INTRADAY TOP 5")
+          print("=" * 78)
+          print("Hierarchy: 1D context → 4H regime → 1H decision → 30M setup → 15M confirmation → 5M trigger")
+          print(f"Qualified setups: {len(results)} | Displayed: TOP {min(TOP_N, len(results))}")
+
+          for rank, r in enumerate(results[:TOP_N], 1):
+              sl, tp, rr, atr5 = r["plan"]
+              side = "BUY" if r["direction"] > 0 else "SELL"
+              cls = "🔥 STRONG" if r["score"] >= 82 else "⭐ MODERATE"
+              print("")
+              print(f"#{rank} {r['pair']} | {side} | {cls}")
+              print(f"SCORE: {r['score']:.1f}/100 | ALIGNMENT: {r['align']}/5")
+              print(f"ENTRY: {r['parts']['m5']['close']:.6f}")
+              print(f"STOP LOSS: {sl:.6f}")
+              print(f"TAKE PROFIT: {tp:.6f}")
+              print(f"R:R: 1:{rr:.2f}")
+              print("TIMEFRAME ALIGNMENT:")
+              for tf in ["1D", "4H", "1H", "30M", "15M", "5M"]:
+                  p = r["parts"][tf]
+                  print(f"  {tf}: {'BUY' if p['direction'] > 0 else 'SELL'} | score {p['score']:.1f}")
+              print("WHY THIS TRADE WAS CHOSEN:")
+              for p in ["h4", "h1", "m30", "m15", "m5"]:
+                  print(f"  {p.upper()}:")
+                  for reason in r["parts"][p]["reasons"]:
+                      print(f"    • {reason}")
+
+          print("")
+          print("=" * 78)
+          print("⏳ WAITING SETUPS")
+          print("=" * 78)
+          print("The scanner does NOT force a trade. Every WAIT includes the current blocker.")
+
+          for r in waits[:TOP_N]:
+              reasons = wait_reasons(r["parts"])
+              print("")
+              print(f"⏳ {r['pair']} | {'BUY' if r['direction'] > 0 else 'SELL'} | score {r['score']:.1f}/100")
+              print("WHY WE ARE WAITING:")
+              for reason in reasons[:6]:
+                  print(f"  • {reason}")
+
+          if not complete_pairs:
+              print("")
+              print("⚠️ SCAN INCOMPLETE")
+              print("No pair had all required completed datasets.")
+              print("This is NOT a no-setup result.")
+          elif not results:
+              print("")
+              print("🟡 NO QUALIFIED TRADE")
+              print("The scan completed, but no pair currently satisfies all qualification rules.")
+              print("WAIT reasons are shown above.")
+
+          print("")
+          print("=" * 78)
+          print("SCAN STATUS")
+          print("=" * 78)
+          print(f"Pairs requested: {len(PAIRS)}")
+          print(f"Pairs fully analyzed: {len(complete_pairs)}/{len(PAIRS)}")
+          print(f"Qualified: {len(results)}")
+          print(f"Waiting/rejected after full data: {len(waits)}")
+          print(f"Data/analysis errors: {len(errors)}")
+          print("TP rule: minimum 2R | NO maximum R:R")
+          print("Open/incomplete candles are excluded.")
+          print("Automatic trading: DISABLED")
+
+          # Hard safety rule: a partial scan is never reported as a clean
+          # no-setup scan.
+          if len(complete_pairs) < len(PAIRS):
+              print("")
+              print("⚠️ SCAN INCOMPLETE — PROCESS EXITING WITH WARNING")
+              raise SystemExit(2)
+
+          print("")
+          print("✅ SCAN COMPLETE — PROCESS EXITING CLEANLY")
+          PY
