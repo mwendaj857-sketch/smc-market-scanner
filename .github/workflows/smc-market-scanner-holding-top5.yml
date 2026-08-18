@@ -1,0 +1,437 @@
+name: SMC Holding Market Scanner
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/15 * * * *"
+
+jobs:
+  scanner:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install requests
+        run: pip install requests
+
+      - name: SMC 9-Method Holding Scanner
+        env:
+          TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
+        run: |
+          python - <<'PY'
+          import os
+          import requests
+
+          API_KEY = os.environ.get("TWELVE_DATA_API_KEY", "").strip()
+          if not API_KEY:
+              raise SystemExit("TWELVE_DATA_API_KEY secret is missing.")
+
+          SYMBOLS = [
+              "EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF", "USD/CAD",
+              "AUD/USD", "NZD/USD",
+              "EUR/GBP", "EUR/JPY", "EUR/CHF", "EUR/AUD", "EUR/CAD",
+              "GBP/JPY", "GBP/CHF", "GBP/AUD", "GBP/CAD",
+              "AUD/JPY", "AUD/NZD", "CAD/JPY", "NZD/JPY"
+          ]
+
+          TIMEFRAMES = {
+              "D1": {"interval": "1day", "outputsize": 260},
+              "H4": {"interval": "4h", "outputsize": 500},
+              "H1": {"interval": "1h", "outputsize": 500},
+          }
+
+          ATR_PERIOD = 14
+          RSI_PERIOD = 14
+          SWING_STRENGTH = 2
+          SWING_LOOKBACK = 80
+          SL_ATR_BUFFER = 0.25
+          MIN_SL_ATR = 1.00
+          MAX_SL_ATR = 3.50
+          RR_TARGET = 2.50
+          ENTRY_ZONE_ATR = 0.35
+          TOP_N = 5
+          MIN_SCORE = 68
+          URL = "https://api.twelvedata.com/time_series"
+
+          def fmt(symbol, value):
+              if value is None:
+                  return "N/A"
+              decimals = 3 if "JPY" in symbol else 5
+              return f"{value:.{decimals}f}"
+
+          def get_candles(symbol, interval, outputsize):
+              params = {
+                  "symbol": symbol, "interval": interval, "outputsize": outputsize,
+                  "apikey": API_KEY, "format": "JSON"
+              }
+              try:
+                  r = requests.get(URL, params=params, timeout=30)
+                  r.raise_for_status()
+                  payload = r.json()
+              except Exception as exc:
+                  print(f"REQUEST ERROR {symbol} {interval}: {exc}")
+                  return []
+              if "values" not in payload:
+                  print(f"API ERROR {symbol} {interval}: {payload}")
+                  return []
+              candles = []
+              for item in reversed(payload["values"]):
+                  try:
+                      candles.append({
+                          "datetime": item["datetime"],
+                          "open": float(item["open"]),
+                          "high": float(item["high"]),
+                          "low": float(item["low"]),
+                          "close": float(item["close"]),
+                      })
+                  except (KeyError, TypeError, ValueError):
+                      continue
+              return candles
+
+          def ema(values, period):
+              if len(values) < period:
+                  return None
+              k = 2.0 / (period + 1)
+              value = sum(values[:period]) / period
+              for price in values[period:]:
+                  value += k * (price - value)
+              return value
+
+          def atr(candles, period=14):
+              if len(candles) < period + 1:
+                  return None
+              trs = []
+              for i in range(1, len(candles)):
+                  h, l, pc = candles[i]["high"], candles[i]["low"], candles[i-1]["close"]
+                  trs.append(max(h-l, abs(h-pc), abs(l-pc)))
+              value = sum(trs[:period]) / period
+              for tr in trs[period:]:
+                  value = ((period-1) * value + tr) / period
+              return value
+
+          def rsi(candles, period=14):
+              if len(candles) < period + 1:
+                  return None
+              gains, losses = [], []
+              for i in range(1, len(candles)):
+                  change = candles[i]["close"] - candles[i-1]["close"]
+                  gains.append(max(change, 0.0))
+                  losses.append(max(-change, 0.0))
+              ag = sum(gains[:period]) / period
+              al = sum(losses[:period]) / period
+              for i in range(period, len(gains)):
+                  ag = ((period-1)*ag + gains[i]) / period
+                  al = ((period-1)*al + losses[i]) / period
+              if al == 0:
+                  return 100.0
+              return 100.0 - (100.0 / (1.0 + ag/al))
+
+          def macd(candles):
+              closes = [c["close"] for c in candles]
+              e12, e26 = ema(closes, 12), ema(closes, 26)
+              return None if e12 is None or e26 is None else e12 - e26
+
+          def swing_high(candles, i, strength=2):
+              if i < strength or i >= len(candles)-strength:
+                  return False
+              h = candles[i]["high"]
+              return all(h > candles[i-j]["high"] and h > candles[i+j]["high"]
+                         for j in range(1, strength+1))
+
+          def swing_low(candles, i, strength=2):
+              if i < strength or i >= len(candles)-strength:
+                  return False
+              l = candles[i]["low"]
+              return all(l < candles[i-j]["low"] and l < candles[i+j]["low"]
+                         for j in range(1, strength+1))
+
+          def find_swings(candles):
+              highs, lows = [], []
+              for i in range(SWING_STRENGTH, len(candles)-SWING_STRENGTH):
+                  if swing_high(candles, i, SWING_STRENGTH):
+                      highs.append({"index": i, "price": candles[i]["high"]})
+                  if swing_low(candles, i, SWING_STRENGTH):
+                      lows.append({"index": i, "price": candles[i]["low"]})
+              return highs, lows
+
+          def structure(highs, lows):
+              if len(highs) < 2 or len(lows) < 2:
+                  return 0, None, "INSUFFICIENT SWINGS"
+              hh = highs[-1]["price"] > highs[-2]["price"]
+              hl = lows[-1]["price"] > lows[-2]["price"]
+              lh = highs[-1]["price"] < highs[-2]["price"]
+              ll = lows[-1]["price"] < lows[-2]["price"]
+              if hh and hl:
+                  return 15, "BUY", "BULLISH HH + HL"
+              if lh and ll:
+                  return 15, "SELL", "BEARISH LH + LL"
+              return 5, None, "MIXED STRUCTURE"
+
+          def liquidity_sweeps(candles, highs, lows):
+              sweeps = []
+              start = max(0, len(candles)-100)
+              for i in range(start, len(candles)):
+                  ph = [x for x in highs if x["index"] < i]
+                  pl = [x for x in lows if x["index"] < i]
+                  if ph and candles[i]["high"] > ph[-1]["price"] and candles[i]["close"] < ph[-1]["price"]:
+                      sweeps.append(("SELL", i, ph[-1]["price"]))
+                  if pl and candles[i]["low"] < pl[-1]["price"] and candles[i]["close"] > pl[-1]["price"]:
+                      sweeps.append(("BUY", i, pl[-1]["price"]))
+              return sweeps
+
+          def smc(candles, highs, lows):
+              sweeps = liquidity_sweeps(candles, highs, lows)
+              if not sweeps:
+                  return 0, None, "NO RECENT LIQUIDITY SWEEP"
+              typ, idx, _ = sweeps[-1]
+              for i in range(idx+1, min(len(candles), idx+15)):
+                  if typ == "BUY":
+                      ph = [x for x in highs if x["index"] < idx]
+                      if ph and candles[i]["close"] > ph[-1]["price"]:
+                          return 20, "BUY", "BULLISH LIQUIDITY SWEEP + MSS"
+                  else:
+                      pl = [x for x in lows if x["index"] < idx]
+                      if pl and candles[i]["close"] < pl[-1]["price"]:
+                          return 20, "SELL", "BEARISH LIQUIDITY SWEEP + MSS"
+              return 0, None, "SWEEP WITHOUT MSS"
+
+          def supply_demand(candles, direction, atr_value):
+              if direction is None or atr_value is None:
+                  return 0, "NO DIRECTION"
+              recent = candles[-30:]
+              best, label = 0, "WEAK SUPPLY/DEMAND"
+              for i in range(2, len(recent)):
+                  base, impulse = recent[i-2], recent[i]
+                  if abs(impulse["close"]-base["close"]) < atr_value*0.8:
+                      continue
+                  if direction == "BUY" and base["close"] <= base["open"] and impulse["close"] > impulse["open"]:
+                      best, label = 10, "DEMAND ZONE + BULLISH IMPULSE"
+                  if direction == "SELL" and base["close"] >= base["open"] and impulse["close"] < impulse["open"]:
+                      best, label = 10, "SUPPLY ZONE + BEARISH IMPULSE"
+              return best, label
+
+          def price_action(candles, direction):
+              if direction is None or len(candles) < 2:
+                  return 0, "NO DIRECTION"
+              c, p = candles[-1], candles[-2]
+              body = abs(c["close"]-c["open"])
+              upper = c["high"]-max(c["open"], c["close"])
+              lower = min(c["open"], c["close"])-c["low"]
+              bull = p["close"] < p["open"] and c["close"] > c["open"] and c["open"] <= p["close"] and c["close"] >= p["open"]
+              bear = p["close"] > p["open"] and c["close"] < c["open"] and c["open"] >= p["close"] and c["close"] <= p["open"]
+              if direction == "BUY":
+                  if bull: return 10, "BULLISH ENGULFING"
+                  if body > 0 and lower > body*1.5: return 8, "BULLISH REJECTION"
+                  if c["close"] > c["open"]: return 5, "BULLISH CANDLE"
+              else:
+                  if bear: return 10, "BEARISH ENGULFING"
+                  if body > 0 and upper > body*1.5: return 8, "BEARISH REJECTION"
+                  if c["close"] < c["open"]: return 5, "BEARISH CANDLE"
+              return 0, "NO STRONG PRICE ACTION"
+
+          def liquidity_score(sweeps, direction):
+              if not sweeps or direction is None:
+                  return 0, "NO RECENT SWEEP"
+              if sweeps[-1][0] == direction:
+                  return 15, f"{direction} LIQUIDITY SWEEP"
+              return 5, "OPPOSING LIQUIDITY SWEEP"
+
+          def fibonacci(candles, highs, lows, direction):
+              if direction is None or not highs or not lows:
+                  return 0, "NO SWING RANGE"
+              high, low = highs[-1]["price"], lows[-1]["price"]
+              if high <= low:
+                  return 0, "INVALID RANGE"
+              current = candles[-1]["close"]
+              if direction == "BUY":
+                  levels = [("0.382", high-(high-low)*0.382), ("0.500", high-(high-low)*0.5),
+                            ("0.618", high-(high-low)*0.618), ("0.786", high-(high-low)*0.786)]
+              else:
+                  levels = [("0.382", low+(high-low)*0.382), ("0.500", low+(high-low)*0.5),
+                            ("0.618", low+(high-low)*0.618), ("0.786", low+(high-low)*0.786)]
+              name, level = min(levels, key=lambda x: abs(current-x[1]))
+              return (5, f"NEAR FIB {name}") if abs(current-level) <= (high-low)*0.04 else (2, f"FIB {name} NOT NEAR")
+
+          def trend(candles, direction):
+              closes = [c["close"] for c in candles]
+              e20, e50, e200 = ema(closes, 20), ema(closes, 50), ema(closes, 200)
+              if None in (e20, e50, e200) or direction is None:
+                  return 0, "INSUFFICIENT DATA"
+              if direction == "BUY" and e20 > e50 > e200:
+                  return 10, "BULLISH EMA ALIGNMENT"
+              if direction == "SELL" and e20 < e50 < e200:
+                  return 10, "BEARISH EMA ALIGNMENT"
+              return 3, "MIXED EMA ALIGNMENT"
+
+          def indicators(candles, direction):
+              r, m = rsi(candles, RSI_PERIOD), macd(candles)
+              if r is None or m is None or direction is None:
+                  return 0, "INSUFFICIENT DATA"
+              if direction == "BUY":
+                  return (5 if r >= 50 and m > 0 else 2), f"RSI {r:.1f} / MACD {m:.6f}"
+              return (5 if r <= 50 and m < 0 else 2), f"RSI {r:.1f} / MACD {m:.6f}"
+
+          def session_score(_):
+              return 10, "HOLDING MODE - SESSION NEUTRAL"
+
+          def tf_score(candles):
+              if len(candles) < 220:
+                  return None
+              atr_value = atr(candles, ATR_PERIOD)
+              highs, lows = find_swings(candles)
+              ms_s, ms_dir, ms_text = structure(highs, lows)
+              smc_s, smc_dir, smc_text = smc(candles, highs, lows)
+              direction = smc_dir or ms_dir
+              sd_s, sd_text = supply_demand(candles, direction, atr_value)
+              pa_s, pa_text = price_action(candles, direction)
+              sweeps = liquidity_sweeps(candles, highs, lows)
+              liq_s, liq_text = liquidity_score(sweeps, direction)
+              fib_s, fib_text = fibonacci(candles, highs, lows, direction)
+              trend_s, trend_text = trend(candles, direction)
+              ind_s, ind_text = indicators(candles, direction)
+              session_s, session_text = session_score(candles)
+              total = sum([ms_s, smc_s, sd_s, pa_s, liq_s, fib_s, trend_s, ind_s, session_s])
+              return {
+                  "direction": direction, "score": total, "atr": atr_value,
+                  "highs": highs, "lows": lows,
+                  "ms": (ms_s, ms_text), "smc": (smc_s, smc_text),
+                  "sd": (sd_s, sd_text), "pa": (pa_s, pa_text),
+                  "liq": (liq_s, liq_text), "fib": (fib_s, fib_text),
+                  "trend": (trend_s, trend_text), "ind": (ind_s, ind_text),
+                  "session": (session_s, session_text),
+              }
+
+          def common_direction(d1, h4, h1):
+              dirs = [d1.get("direction"), h4.get("direction"), h1.get("direction")]
+              if dirs.count("BUY") >= 2 and h4["direction"] == "BUY":
+                  return "BUY"
+              if dirs.count("SELL") >= 2 and h4["direction"] == "SELL":
+                  return "SELL"
+              return None
+
+          def build_holding_levels(candles_h4, h4, direction):
+              if direction not in ("BUY", "SELL") or h4["atr"] is None:
+                  return None
+              entry_market = candles_h4[-1]["close"]
+              atr4 = h4["atr"]
+              highs, lows = h4["highs"], h4["lows"]
+              recent_lows = [x["price"] for x in lows[-SWING_LOOKBACK:] if x["price"] < entry_market]
+              recent_highs = [x["price"] for x in highs[-SWING_LOOKBACK:] if x["price"] > entry_market]
+
+              if direction == "BUY":
+                  protected = recent_lows[-1] if recent_lows else min(c["low"] for c in candles_h4[-40:])
+                  sl = min(protected-atr4*SL_ATR_BUFFER, entry_market-atr4*MIN_SL_ATR)
+                  risk = entry_market-sl
+                  tp = entry_market+risk*RR_TARGET
+              else:
+                  protected = recent_highs[-1] if recent_highs else max(c["high"] for c in candles_h4[-40:])
+                  sl = max(protected+atr4*SL_ATR_BUFFER, entry_market+atr4*MIN_SL_ATR)
+                  risk = sl-entry_market
+                  tp = entry_market-risk*RR_TARGET
+
+              risk_atr = risk/atr4
+              if risk <= 0 or risk_atr > MAX_SL_ATR:
+                  return None
+
+              if direction == "BUY":
+                  pullback = protected + ENTRY_ZONE_ATR*atr4
+                  entry = min(entry_market, pullback)
+                  entry = max(entry, protected + 0.05*atr4)
+                  sl = min(sl, entry-MIN_SL_ATR*atr4)
+                  risk = entry-sl
+                  tp = entry+risk*RR_TARGET
+              else:
+                  pullback = protected - ENTRY_ZONE_ATR*atr4
+                  entry = max(entry_market, pullback)
+                  entry = min(entry, protected-0.05*atr4)
+                  sl = max(sl, entry+MIN_SL_ATR*atr4)
+                  risk = sl-entry
+                  tp = entry-risk*RR_TARGET
+
+              return {
+                  "entry": entry, "sl": sl, "tp": tp, "risk": risk,
+                  "risk_atr": risk/atr4,
+                  "basis": "4H protected swing + ATR buffer",
+                  "entry_type": "CURRENT / CONTROLLED PULLBACK ZONE",
+              }
+
+          def analyze(symbol):
+              data = {}
+              for name, cfg in TIMEFRAMES.items():
+                  candles = get_candles(symbol, cfg["interval"], cfg["outputsize"])
+                  if len(candles) < 220:
+                      return None
+                  data[name] = (candles, tf_score(candles))
+
+              d1, h4, h1 = data["D1"][1], data["H4"][1], data["H1"][1]
+              direction = common_direction(d1, h4, h1)
+              if direction is None:
+                  return None
+
+              score = h4["score"]*0.55 + d1["score"]*0.25 + h1["score"]*0.20
+              if d1["direction"] != direction:
+                  score -= 8
+              if h1["direction"] != direction:
+                  score -= 5
+
+              levels = build_holding_levels(data["H4"][0], h4, direction)
+              if not levels or levels["risk_atr"] > MAX_SL_ATR:
+                  return None
+
+              confirmations = sum(x["direction"] == direction for x in (d1, h4, h1))
+              score += confirmations*2
+              if score < MIN_SCORE:
+                  return None
+
+              signal = "STRONG" if score >= 78 else "MODERATE"
+              return {
+                  "symbol": symbol, "direction": direction, "score": round(score, 1),
+                  "signal": signal, "d1": d1, "h4": h4, "h1": h1, "levels": levels
+              }
+
+          print("="*78)
+          print("SMC 9-METHOD MULTI-TIMEFRAME HOLDING SCANNER")
+          print("="*78)
+          print("Mode: HOLDING / SWING")
+          print("Decision timeframe: 4H | Higher-timeframe regime: 1D | Entry confirmation: 1H")
+          print(f"Universe: {len(SYMBOLS)} liquid G10 currency pairs")
+          print("Automatic trading: DISABLED")
+          print("Output: TOP 5 ONLY")
+          print("9 methods retained; market selection is now comparative across the full universe.")
+
+          results = []
+          for symbol in SYMBOLS:
+              try:
+                  result = analyze(symbol)
+                  if result:
+                      results.append(result)
+              except Exception as exc:
+                  print(f"SCAN ERROR {symbol}: {type(exc).__name__}: {exc}")
+
+          results.sort(key=lambda x: x["score"], reverse=True)
+          top = results[:TOP_N]
+
+          print("\n"+"="*78)
+          print("TOP 5 MOST PRECISE HOLDING SETUPS")
+          print("="*78)
+
+          if not top:
+              print("NO QUALIFIED HOLDING SETUPS.")
+              print("No pair reached the multi-timeframe quality threshold.")
+          else:
+              for rank, r in enumerate(top, 1):
+                  lv, h4, d1, h1 = r["levels"], r["h4"], r["d1"], r["h1"]
+                  print(f"\n#{rank} {r['symbol']} | {r['direction']} | {r['signal']} | {r['score']}/100")
+                  print(f"1D bias: {d1['direction'] or 'MIXED'} | 4H: {h4['direction'] or 'MIXED'} | 1H: {h1['direction'] or 'MIXED'}")
+                  print(f"4H Entry: {fmt(r['symbol'], lv['entry'])}")
+                  print(f"4H Stop Loss: {fmt(r['symbol'], lv['sl'])}")
+                  print(f"Take Profit: {fmt(r['symbol'], lv['tp'])}")
+                  print(f"Risk: {lv['risk_atr']:.2f} ATR | R:R = 1:{RR_TARGET:.2f}")
+                  print(f"Entry model: {lv['entry_type']}")
+                  print(f"Stop model: {lv['basis']}")
+                  print(f"9-method 4H score: {h4['score']}/100")
+
+          print("\n"+"="*78)
+          print("SCAN COMPLETE")
+          print("The full universe is analyzed first; only the five strongest aligned holding setups are displayed.")
+          print("Automatic trading remains disabled.")
+          PY
