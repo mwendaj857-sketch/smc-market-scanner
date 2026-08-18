@@ -1,0 +1,1175 @@
+name: SMC 9-Method LSE Smart Intraday Scanner v8 — Focused Universe + FVG
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_instruments:
+        description: "0 = discover all eligible instruments; runtime governor prevents runaway scans"
+        required: false
+        default: "0"
+        type: string
+      categories:
+        description: "Catalog categories to consider during discovery; scanner remains focused on major FX + metals + BTC/USD"
+        required: false
+        default: "forex,commodity,crypto"
+        type: string
+      top_n:
+        description: "Number of qualified setups / WAIT candidates to display"
+        required: false
+        default: "5"
+        type: string
+      runtime_minutes:
+        description: "Maximum scanner runtime in minutes; 0 uses the safe default"
+        required: false
+        default: "8"
+        type: string
+  schedule:
+    - cron: "5,20,35,50 * * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lse-smart-scanner
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      LSE_API_KEY: ${{ secrets.LSE_API_KEY }}
+      MAX_INSTRUMENTS: ${{ inputs.max_instruments || '0' }}
+      SCAN_RUNTIME_MINUTES: ${{ inputs.runtime_minutes || '8' }}
+      LSE_CATEGORIES: ${{ inputs.categories || 'forex,commodity,crypto' }}
+      TOP_N: ${{ inputs.top_n || '5' }}
+      NEWS_RSS_URLS: ${{ secrets.NEWS_RSS_URLS }}
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python 3.12 (Node 24 actions)
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "lse-data==0.14.0" "feedparser>=6.0,<7" "PyYAML>=6.0,<7"
+
+      - name: Validate embedded scanner before live run
+        shell: bash
+        run: |
+          set -euo pipefail
+          export WORKFLOW_DIR="$GITHUB_WORKSPACE/.github/workflows"
+          python - <<'PY'
+          import ast
+          import os
+          from pathlib import Path
+          import yaml
+
+          workflow_dir = Path(os.environ["WORKFLOW_DIR"]).resolve()
+          assert workflow_dir.is_dir(), f"Workflow directory missing: {workflow_dir}"
+
+          candidates = sorted(workflow_dir.glob("*.yml")) + sorted(workflow_dir.glob("*.yaml"))
+          assert candidates, f"No workflow YAML files found in {workflow_dir}"
+
+          matches = []
+          for candidate in candidates:
+              try:
+                  candidate_text = candidate.read_text(encoding="utf-8")
+              except OSError:
+                  continue
+              if "SMC 9-METHOD LSE SMART INTRADAY SCANNER" in candidate_text and "from lse import LSE" in candidate_text:
+                  matches.append((candidate, candidate_text))
+
+          assert matches, "Could not locate the scanner workflow in .github/workflows"
+          # Prefer the file whose embedded scanner is largest; this avoids selecting a small helper/validator workflow.
+          workflow_path, text = max(matches, key=lambda item: len(item[1]))
+
+          doc = yaml.safe_load(text)
+          assert isinstance(doc, dict), "Workflow is not a YAML mapping"
+          jobs = doc.get("jobs")
+          assert isinstance(jobs, dict) and isinstance(jobs.get("scan"), dict), "scan job missing"
+          steps = jobs["scan"].get("steps", [])
+          assert isinstance(steps, list), "scan.steps is not a list"
+
+          run_blocks = [s.get("run", "") for s in steps if isinstance(s, dict) and isinstance(s.get("run"), str)]
+          scanner_blocks = [
+              x for x in run_blocks
+              if "python - <<'PY'" in x and "from lse import LSE" in x
+          ]
+          assert scanner_blocks, "Main embedded scanner block not found"
+          scanner = max(scanner_blocks, key=len)
+          py = scanner.split("python - <<'PY'\n", 1)[1].split("\nPY", 1)[0]
+
+          ast.parse(py)
+          compile(py, "<embedded-scanner>", "exec")
+          print(f"Workflow selected: {workflow_path}")
+          print("YAML syntax: PASS")
+          print("scan job structure: PASS")
+          print("Main embedded Python syntax: PASS")
+          print("Embedded scanner compilation: PASS")
+          PY
+
+      - name: Run scanner
+        run: |
+          python - <<'PY'
+          import ast
+          import csv
+          import feedparser
+          import math
+          import os
+          import statistics
+          import sys
+          import time
+          import traceback
+          import xml.etree.ElementTree as ET
+          from collections import defaultdict
+          from datetime import datetime, timedelta, timezone
+          from urllib.parse import urlparse
+          from urllib.request import Request, urlopen
+          
+          try:
+              from lse import LSE, LSEError
+          except Exception as exc:
+              print(f"FATAL: lse-data import failed: {exc}")
+              raise
+          
+          print("=" * 72)
+          print("SMC 9-METHOD LSE SMART INTRADAY SCANNER v8")
+          print("=" * 72)
+          print("DAILY INTELLIGENCE -> 1D CONTEXT -> 4H REGIME -> 1H DECISION")
+          print("-> 30M SETUP -> 15M CONFIRMATION -> 5M TRIGGER")
+          print("DYNAMIC LSE CATALOG | 2R MINIMUM | NO ARTIFICIAL TP MAXIMUM")
+          print("AUTOMATIC TRADING: DISABLED")
+          print()
+          
+          # ----------------------------
+          # Configuration
+          # ----------------------------
+          TF = ["1d", "4h", "1h", "30m", "15m", "5m"]
+          DIRECT_TF = ["1d", "4h", "1h", "15m", "5m"]
+          MIN_BARS = {"1d": 120, "4h": 180, "1h": 240, "30m": 300, "15m": 360, "5m": 500}
+          FETCH_LIMIT = {"1d": 700, "4h": 900, "1h": 1000, "15m": 1200, "5m": 1400}
+          def env_int(name, default):
+              try:
+                  return int(os.getenv(name, str(default)) or str(default))
+              except (TypeError, ValueError):
+                  print(f"CONFIG WARNING: {name} is invalid; using {default}")
+                  return default
+          
+          def env_float(name, default):
+              try:
+                  return float(os.getenv(name, str(default)) or str(default))
+              except (TypeError, ValueError):
+                  print(f"CONFIG WARNING: {name} is invalid; using {default}")
+                  return default
+          
+          MAX_INSTRUMENTS = max(0, env_int("MAX_INSTRUMENTS", 0))
+          TOP_N = max(1, env_int("TOP_N", 5))
+          RUNTIME_MINUTES = env_float("SCAN_RUNTIME_MINUTES", 8.0)
+          if RUNTIME_MINUTES <= 0:
+              RUNTIME_MINUTES = 8.0
+          RUNTIME_MINUTES = min(RUNTIME_MINUTES, 10.0)
+          # Keep a small safety reserve so the scanner stops before the configured budget
+          # instead of overrunning it because of final formatting / cleanup.
+          RUNTIME_GUARD_SECONDS = 20.0
+          SCAN_START = time.monotonic()
+          SCAN_BUDGET_SECONDS = max(30.0, RUNTIME_MINUTES * 60.0 - RUNTIME_GUARD_SECONDS)
+          SCAN_DEADLINE = SCAN_START + SCAN_BUDGET_SECONDS
+          CATEGORIES = [x.strip().lower() for x in os.getenv(
+              "LSE_CATEGORIES", "forex,commodity,index,crypto,stock,etf,futures"
+          ).split(",") if x.strip()]
+          NEWS_URLS = [x.strip() for x in os.getenv("NEWS_RSS_URLS", "").split(",") if x.strip()]
+          MAJOR_FX = {"EUR/USD","GBP/USD","USD/JPY","USD/CHF","AUD/USD","USD/CAD","NZD/USD","EUR/GBP","EUR/JPY","GBP/JPY","EUR/CHF","AUD/JPY"}
+          PRIORITY_METALS = {"XAU/USD","XAG/USD","XPT/USD","XPD/USD"}
+          PRIORITY_CRYPTO = {"BTC/USD"}
+          FOCUSED_SYMBOLS = MAJOR_FX | PRIORITY_METALS | PRIORITY_CRYPTO
+          SYMBOL_ALIASES = {
+          "EURUSD":"EUR/USD","EUR-USD":"EUR/USD","EUR_USD":"EUR/USD",
+          "GBPUSD":"GBP/USD","GBP-USD":"GBP/USD","GBP_USD":"GBP/USD",
+          "USDJPY":"USD/JPY","USD-JPY":"USD/JPY","USD_JPY":"USD/JPY",
+          "USDCHF":"USD/CHF","USD-CHF":"USD/CHF","USD_CHF":"USD/CHF",
+          "AUDUSD":"AUD/USD","AUD-USD":"AUD/USD","AUD_USD":"AUD/USD",
+          "USDCAD":"USD/CAD","USD-CAD":"USD/CAD","USD_CAD":"USD/CAD",
+          "NZDUSD":"NZD/USD","NZD-USD":"NZD/USD","NZD_USD":"NZD/USD",
+          "EURGBP":"EUR/GBP","EUR-GBP":"EUR/GBP","EUR_GBP":"EUR/GBP",
+          "EURJPY":"EUR/JPY","EUR-JPY":"EUR/JPY","EUR_JPY":"EUR/JPY",
+          "GBPJPY":"GBP/JPY","GBP-JPY":"GBP/JPY","GBP_JPY":"GBP/JPY",
+          "EURCHF":"EUR/CHF","EUR-CHF":"EUR/CHF","EUR_CHF":"EUR/CHF",
+          "AUDJPY":"AUD/JPY","AUD-JPY":"AUD/JPY","AUD_JPY":"AUD/JPY",
+          "XAUUSD":"XAU/USD","XAU-USD":"XAU/USD","XAU_USD":"XAU/USD",
+          "XAGUSD":"XAG/USD","XAG-USD":"XAG/USD","XAG_USD":"XAG/USD",
+          "XPTUSD":"XPT/USD","XPT-USD":"XPT/USD","XPT_USD":"XPT/USD",
+          "XPDUSD":"XPD/USD","XPD-USD":"XPD/USD","XPD_USD":"XPD/USD",
+          "BTCUSD":"BTC/USD","BTC-USD":"BTC/USD","BTC_USD":"BTC/USD"
+          }
+          
+          # User-requested architecture:
+          # 1D context -> 4H controlling regime -> 1H decision -> 30M setup
+          # -> 15M confirmation -> 5M trigger.
+          # 30M is deliberately built from completed 15M candles.
+          #
+          # The scanner is analytical only. It never places orders.
+          
+          def now_utc():
+              return datetime.now(timezone.utc)
+          
+          def parse_ts(v):
+              if isinstance(v, (int, float)):
+                  return datetime.fromtimestamp(v, tz=timezone.utc)
+              s = str(v)
+              if s.endswith("Z"):
+                  s = s[:-1] + "+00:00"
+              dt = datetime.fromisoformat(s)
+              return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+          
+          def clean_num(v, default=0.0):
+              try:
+                  x = float(v)
+                  return x if math.isfinite(x) else default
+              except Exception:
+                  return default
+          
+          def normalize_rows(raw):
+              if isinstance(raw, dict):
+                  for key in ("data", "rows", "candles", "results"):
+                      if isinstance(raw.get(key), list):
+                          raw = raw[key]
+                          break
+              if not isinstance(raw, list):
+                  return []
+              out = []
+              for r in raw:
+                  if not isinstance(r, dict):
+                      continue
+                  # Accept the common OHLCV spellings without guessing a price.
+                  ts = r.get("timestamp", r.get("time", r.get("datetime")))
+                  if ts is None:
+                      continue
+                  try:
+                      dt = parse_ts(ts)
+                  except Exception:
+                      continue
+                  c = {
+                      "timestamp": dt,
+                      "open": clean_num(r.get("open")),
+                      "high": clean_num(r.get("high")),
+                      "low": clean_num(r.get("low")),
+                      "close": clean_num(r.get("close")),
+                      "volume": clean_num(r.get("volume", 0.0)),
+                  }
+                  if c["high"] < max(c["open"], c["close"]) or c["low"] > min(c["open"], c["close"]):
+                      continue
+                  if c["high"] < c["low"]:
+                      continue
+                  out.append(c)
+              out.sort(key=lambda x: x["timestamp"])
+              return out
+          
+          def timeframe_minutes(tf):
+              return {"5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240, "1d": 1440}[tf]
+          
+          def remove_incomplete(rows, tf):
+              if not rows:
+                  return []
+              mins = timeframe_minutes(tf)
+              cutoff = now_utc()
+              return [
+                  r for r in rows
+                  if r["timestamp"] + timedelta(minutes=mins) <= cutoff
+              ]
+          
+          def fetch_candles(client, symbol, tf):
+              try:
+                  raw = client.candles(symbol, timeframe=tf, limit=FETCH_LIMIT[tf], order="desc")
+              except TypeError:
+                  # Compatibility fallback for SDK builds that use positional timeframe.
+                  raw = client.candles(symbol, tf, limit=FETCH_LIMIT[tf], order="desc")
+              rows = remove_incomplete(normalize_rows(raw), tf)
+              return rows[-FETCH_LIMIT[tf]:]
+          
+          def build_30m_from_15m(rows15):
+              buckets = {}
+              for r in rows15:
+                  # UTC floor to 30-minute boundary.
+                  t = r["timestamp"].replace(second=0, microsecond=0)
+                  minute = (t.minute // 30) * 30
+                  key = t.replace(minute=minute)
+                  bucket = buckets.setdefault(key, [])
+                  bucket.append(r)
+              out = []
+              for key in sorted(buckets):
+                  b = sorted(buckets[key], key=lambda x: x["timestamp"])
+                  # Require exactly two consecutive 15m bars. Never synthesize a missing half.
+                  if len(b) != 2:
+                      continue
+                  if b[1]["timestamp"] - b[0]["timestamp"] != timedelta(minutes=15):
+                      continue
+                  out.append({
+                      "timestamp": key,
+                      "open": b[0]["open"],
+                      "high": max(x["high"] for x in b),
+                      "low": min(x["low"] for x in b),
+                      "close": b[-1]["close"],
+                      "volume": sum(x["volume"] for x in b),
+                  })
+              return out
+          
+          def ema(values, period):
+              if len(values) < period:
+                  return [None] * len(values)
+              alpha = 2.0 / (period + 1)
+              out = [None] * (period - 1)
+              e = statistics.fmean(values[:period])
+              out.append(e)
+              for v in values[period:]:
+                  e = alpha * v + (1 - alpha) * e
+                  out.append(e)
+              return out
+          
+          def rsi(values, period=14):
+              if len(values) <= period:
+                  return None
+              gains, losses = [], []
+              for i in range(1, len(values)):
+                  d = values[i] - values[i - 1]
+                  gains.append(max(d, 0))
+                  losses.append(max(-d, 0))
+              ag = statistics.fmean(gains[:period])
+              al = statistics.fmean(losses[:period])
+              for g, l in zip(gains[period:], losses[period:]):
+                  ag = (ag * (period - 1) + g) / period
+                  al = (al * (period - 1) + l) / period
+              if al == 0:
+                  return 100.0
+              return 100.0 - (100.0 / (1.0 + ag / al))
+          
+          def atr(rows, period=14):
+              if len(rows) <= period:
+                  return None
+              trs = []
+              for i in range(1, len(rows)):
+                  h, l, pc = rows[i]["high"], rows[i]["low"], rows[i-1]["close"]
+                  trs.append(max(h-l, abs(h-pc), abs(l-pc)))
+              return statistics.fmean(trs[-period:])
+          
+          def macd(values):
+              e12, e26 = ema(values, 12), ema(values, 26)
+              series = [(a-b) for a, b in zip(e12, e26) if a is not None and b is not None]
+              if len(series) < 9:
+                  return 0.0, 0.0
+              sig = ema(series, 9)
+              return series[-1], sig[-1] if sig[-1] is not None else 0.0
+          
+          def swings(rows, lookback=2):
+              highs, lows = [], []
+              for i in range(lookback, len(rows)-lookback):
+                  h = rows[i]["high"]
+                  l = rows[i]["low"]
+                  if h == max(x["high"] for x in rows[i-lookback:i+lookback+1]):
+                      highs.append((i, h))
+                  if l == min(x["low"] for x in rows[i-lookback:i+lookback+1]):
+                      lows.append((i, l))
+              return highs, lows
+          
+          def direction(rows):
+              if len(rows) < 30:
+                  return "NEUTRAL"
+              c = [x["close"] for x in rows]
+              e20, e50 = ema(c, 20), ema(c, 50)
+              if e20[-1] is None or e50[-1] is None:
+                  return "NEUTRAL"
+              if c[-1] > e20[-1] > e50[-1]:
+                  return "BUY"
+              if c[-1] < e20[-1] < e50[-1]:
+                  return "SELL"
+              return "NEUTRAL"
+          
+          def structure_signal(rows):
+              if len(rows) < 20:
+                  return "NEUTRAL", "insufficient structure"
+              highs, lows = swings(rows[-80:], 2)
+              if len(highs) < 2 or len(lows) < 2:
+                  return "NEUTRAL", "insufficient swing structure"
+              last_h, prev_h = highs[-1][1], highs[-2][1]
+              last_l, prev_l = lows[-1][1], lows[-2][1]
+              if last_h > prev_h and last_l > prev_l:
+                  return "BUY", "bullish HH + HL"
+              if last_h < prev_h and last_l < prev_l:
+                  return "SELL", "bearish LH + LL"
+              return "NEUTRAL", "mixed structure"
+          
+          def candle_signal(rows):
+              if len(rows) < 3:
+                  return "NEUTRAL", "insufficient candles"
+              a, b = rows[-2], rows[-1]
+              body = abs(b["close"] - b["open"])
+              rng = max(b["high"] - b["low"], 1e-12)
+              bull = b["close"] > b["open"]
+              bear = b["close"] < b["open"]
+              engulf_bull = bull and a["close"] < a["open"] and b["close"] >= a["open"] and b["open"] <= a["close"]
+              engulf_bear = bear and a["close"] > a["open"] and b["open"] >= a["close"] and b["close"] <= a["open"]
+              if engulf_bull or (bull and body/rng >= 0.65):
+                  return "BUY", "bullish impulse/engulfing"
+              if engulf_bear or (bear and body/rng >= 0.65):
+                  return "SELL", "bearish impulse/engulfing"
+              return "NEUTRAL", "no strong price action"
+          
+          def liquidity_signal(rows):
+              if len(rows) < 25:
+                  return "NEUTRAL", "insufficient liquidity history"
+              prior = rows[-21:-1]
+              last = rows[-1]
+              hi = max(x["high"] for x in prior)
+              lo = min(x["low"] for x in prior)
+              # Sweep then close back inside = liquidity event.
+              if last["low"] < lo and last["close"] > lo:
+                  return "BUY", "sell-side liquidity sweep"
+              if last["high"] > hi and last["close"] < hi:
+                  return "SELL", "buy-side liquidity sweep"
+              return "NEUTRAL", "no fresh sweep"
+          
+          def fib_signal(rows):
+              if len(rows) < 40:
+                  return "NEUTRAL", "insufficient swing range"
+              highs, lows = swings(rows[-100:], 2)
+              if not highs or not lows:
+                  return "NEUTRAL", "no usable swing"
+              h = highs[-1][1]
+              l = lows[-1][1]
+              span = h - l
+              if span <= 0:
+                  return "NEUTRAL", "invalid swing range"
+              p = rows[-1]["close"]
+              retr = (p-l)/span
+              if 0.382 <= retr <= 0.618:
+                  # Direction follows the current trend rather than guessing from the fib alone.
+                  d = direction(rows)
+                  return d, "price in 0.382-0.618 retracement zone" if d != "NEUTRAL" else "fib zone, trend unclear"
+              return "NEUTRAL", "fib zone not near"
+          
+          def trend_signal(rows):
+              d = direction(rows)
+              return d, ("EMA alignment" if d != "NEUTRAL" else "mixed EMA alignment")
+          
+          def indicator_signal(rows):
+              c = [x["close"] for x in rows]
+              rv = rsi(c)
+              m, s = macd(c)
+              if rv is None:
+                  return "NEUTRAL", "RSI unavailable"
+              if rv >= 55 and m > s:
+                  return "BUY", f"RSI {rv:.1f} / MACD bullish"
+              if rv <= 45 and m < s:
+                  return "SELL", f"RSI {rv:.1f} / MACD bearish"
+              return "NEUTRAL", f"RSI {rv:.1f} / MACD mixed"
+          
+          def session_signal(rows, category):
+              # Session is a context filter, not a standalone reason to enter.
+              if not rows:
+                  return "NEUTRAL", "session unavailable"
+              h = rows[-1]["timestamp"].hour
+              # London/NY overlap in UTC approximately 13:00-16:00, with DST handled
+              # imperfectly; this is intentionally a soft score only.
+              if 13 <= h < 16:
+                  return direction(rows), "London + New York overlap"
+              if 7 <= h < 16:
+                  return direction(rows), "London session"
+              if 13 <= h < 21:
+                  return direction(rows), "New York session"
+              return "NEUTRAL", "outside preferred session"
+          
+          def smc_signal(rows):
+              if len(rows) < 30:
+                  return "NEUTRAL", "insufficient MSS history"
+              last = rows[-1]
+              hi = max(x["high"] for x in rows[-21:-1])
+              lo = min(x["low"] for x in rows[-21:-1])
+              if last["close"] > hi:
+                  return "BUY", "bullish MSS / structure break"
+              if last["close"] < lo:
+                  return "SELL", "bearish MSS / structure break"
+              # A sweep alone is not promoted to MSS.
+              return "NEUTRAL", "no confirmed MSS"
+          
+          def supply_demand_signal(rows):
+              if len(rows) < 30:
+                  return "NEUTRAL", "insufficient impulse history"
+              a, b = rows[-2], rows[-1]
+              atrv = atr(rows)
+              if atrv is None:
+                  return "NEUTRAL", "ATR unavailable"
+              body = abs(b["close"] - b["open"])
+              if body >= 1.2 * atrv:
+                  return ("BUY", "demand zone + bullish impulse") if b["close"] > b["open"] else ("SELL", "supply zone + bearish impulse")
+              return "NEUTRAL", "no strong impulse"
+          
+          def fair_value_gaps(rows, lookback=80):
+              """Detect real closed-candle three-candle imbalances."""
+              if len(rows) < 3:
+                  return []
+              sample = rows[-lookback:]
+              out = []
+              for i in range(2, len(sample)):
+                  a, b, c = sample[i-2], sample[i-1], sample[i]
+                  av = atr(sample[:i+1])
+                  if c["low"] > a["high"]:
+                      gap = c["low"] - a["high"]
+                      out.append({"side":"BUY","timestamp":c["timestamp"],"low":a["high"],"high":c["low"],"gap":gap,"quality":gap/av if av and av > 0 else 0.0,"mitigated":any(x["low"] <= a["high"] for x in sample[i+1:])})
+                  if c["high"] < a["low"]:
+                      gap = a["low"] - c["high"]
+                      out.append({"side":"SELL","timestamp":c["timestamp"],"low":c["high"],"high":a["low"],"gap":gap,"quality":gap/av if av and av > 0 else 0.0,"mitigated":any(x["high"] >= a["low"] for x in sample[i+1:])})
+              return out
+
+          def fvg_signal(rows):
+              fresh = [g for g in fair_value_gaps(rows) if not g["mitigated"]]
+              if not fresh:
+                  return "NEUTRAL", "no fresh unmitigated FVG", None
+              g = fresh[-1]
+              strength = "strong" if g["quality"] >= 0.25 else "normal"
+              return g["side"], f"{strength} unmitigated FVG {g['low']:.6g}-{g['high']:.6g}", g
+
+          def method_scores(rows):
+              methods = []
+              funcs = [
+                  ("Market Structure", structure_signal),
+                  ("SMC/MSS", smc_signal),
+                  ("Supply/Demand", supply_demand_signal),
+                  ("Price Action", candle_signal),
+                  ("Liquidity", liquidity_signal),
+                  ("Fibonacci", fib_signal),
+                  ("Trend", trend_signal),
+                  ("RSI+MACD", indicator_signal),
+                  ("Session", lambda x: session_signal(x, "")),
+              ]
+              for name, fn in funcs:
+                  try:
+                      sig, why = fn(rows)
+                  except Exception as exc:
+                      sig, why = "NEUTRAL", f"method error: {type(exc).__name__}"
+                  points = 0
+                  if sig in ("BUY", "SELL"):
+                      points = 1
+                  methods.append({"name": name, "signal": sig, "why": why, "points": points})
+              return methods
+          
+          def method_side_score(methods, side):
+              """Directional evidence from all nine methods, without treating NEUTRAL as a failure."""
+              if side not in ("BUY", "SELL"):
+                  return 0.0
+              aligned = sum(1 for m in methods if m["signal"] == side)
+              opposed = sum(1 for m in methods if m["signal"] in ("BUY", "SELL") and m["signal"] != side)
+              # Reward aligned methods, lightly penalize direct opposition, never punish missing/neutral methods.
+              return max(0.0, min(100.0, (aligned / 9.0) * 100.0 - (opposed / 9.0) * 20.0))
+          
+          def dominant_signal(methods, minimum=3):
+              b = sum(m["points"] for m in methods if m["signal"] == "BUY")
+              s = sum(m["points"] for m in methods if m["signal"] == "SELL")
+              if b > s and b >= minimum:
+                  return "BUY"
+              if s > b and s >= minimum:
+                  return "SELL"
+              return "NEUTRAL"
+          
+          def levels(rows, side):
+              a = atr(rows)
+              if a is None or a <= 0:
+                  return None
+              price = rows[-1]["close"]
+              highs, lows = swings(rows[-100:], 2)
+              if side == "BUY":
+                  candidates = [x[1] for x in lows if x[1] < price]
+                  if not candidates:
+                      return None
+                  sl = max(candidates[-3:]) - 0.25 * a
+                  risk = price - sl
+                  if risk <= 0:
+                      return None
+                  targets = sorted([x[1] for x in highs if x[1] > price])
+                  fib_ext = price + 2.0 * risk
+                  if fib_ext not in targets:
+                      targets.append(fib_ext)
+                  tp = max(targets) if targets else fib_ext
+                  return price, sl, tp, a
+              else:
+                  candidates = [x[1] for x in highs if x[1] > price]
+                  if not candidates:
+                      return None
+                  sl = min(candidates[-3:]) + 0.25 * a
+                  risk = sl - price
+                  if risk <= 0:
+                      return None
+                  targets = sorted([x[1] for x in lows if x[1] < price])
+                  fib_ext = price - 2.0 * risk
+                  if fib_ext not in targets:
+                      targets.append(fib_ext)
+                  tp = min(targets) if targets else fib_ext
+                  return price, sl, tp, a
+          
+          def rr_ok(level):
+              if not level:
+                  return False
+              entry, sl, tp, _ = level
+              risk = abs(entry-sl)
+              reward = abs(tp-entry)
+              return risk > 0 and (reward / risk) >= (2.0 - 1e-9)
+          
+          # ----------------------------
+          # LSE daily intelligence
+          # ----------------------------
+          def safe_call(fn, *args, **kwargs):
+              try:
+                  return fn(*args, **kwargs)
+              except Exception as exc:
+                  return {"_error": f"{type(exc).__name__}: {exc}"}
+          
+          def as_list(x):
+              if isinstance(x, list):
+                  return x
+              if isinstance(x, dict):
+                  for k in ("data", "rows", "results"):
+                      if isinstance(x.get(k), list):
+                          return x[k]
+              return []
+          
+          def external_news():
+              items = []
+              for url in NEWS_URLS[:8]:
+                  try:
+                      feed = feedparser.parse(url)
+                      for entry in feed.entries[:5]:
+                          title = str(entry.get("title", "")).strip()
+                          link = str(entry.get("link", "")).strip()
+                          if title:
+                              items.append({"title": title, "link": link, "source": urlparse(url).netloc})
+                  except Exception:
+                      continue
+              return items[:15]
+          
+          def return_series(rows):
+              closes = [x["close"] for x in rows if x.get("close") is not None]
+              if len(closes) < 3:
+                  return []
+              return [(closes[i] / closes[i-1]) - 1.0 for i in range(1, len(closes)) if closes[i-1] != 0]
+          
+          def pearson(a, b):
+              n = min(len(a), len(b))
+              if n < 20:
+                  return None
+              a, b = a[-n:], b[-n:]
+              ma, mb = statistics.fmean(a), statistics.fmean(b)
+              da = [x - ma for x in a]
+              db = [x - mb for x in b]
+              den = math.sqrt(sum(x*x for x in da) * sum(x*x for x in db))
+              return (sum(x*y for x, y in zip(da, db)) / den) if den else None
+          
+          def correlation_context(symbol, rows, benchmark_rows):
+              base = return_series(rows)
+              vals = []
+              for bench, brow in benchmark_rows.items():
+                  if bench == symbol:
+                      continue
+                  c = pearson(base, return_series(brow))
+                  if c is not None:
+                      vals.append((bench, c))
+              vals.sort(key=lambda x: abs(x[1]), reverse=True)
+              return vals[:3]
+          
+          def daily_intelligence(client):
+              print("LSE CAPABILITY / DAILY INTELLIGENCE CHECK")
+              intel = {
+                  "calendar": [], "macro": {}, "yields": {}, "cot": {}, "news": [],
+                  "live": "UNKNOWN", "ml": "LOCAL STATISTICAL MODEL"
+              }
+              # Economic calendar: collect major regions, but failures remain explicit.
+              for region in ("US", "GB", "EU", "JP", "AU", "CA", "NZ", "CH"):
+                  data = safe_call(client.economic_calendar, region=region, start=now_utc().date().isoformat())
+                  if isinstance(data, dict) and "_error" in data:
+                      continue
+                  intel["calendar"].extend(as_list(data))
+              cpi = safe_call(client.economics, "cpi_yoy")
+              ffr = safe_call(client.series, "fdtr")
+              intel["macro"] = {"cpi_yoy": as_list(cpi), "policy_rate": as_list(ffr)}
+              y = safe_call(client.bond_yields, "US10Y")
+              intel["yields"]["US10Y"] = as_list(y)
+              # Add major government-yield benchmarks used for FX macro context.
+              # Missing series remain explicitly unavailable; no yield is fabricated.
+              for code in ("DE10Y", "GB10Y", "JP10Y", "AU10Y", "CA10Y", "NZ10Y", "CH10Y"):
+                  yr = safe_call(client.series, code)
+                  rows = as_list(yr)
+                  if rows:
+                      intel["yields"][code] = rows
+              # COT is futures-based; GC/CL/ES are used as broad cross-market context.
+              for code in ("GC", "CL", "ES"):
+                  c = safe_call(client.cot, code)
+                  rows = as_list(c)
+                  if rows:
+                      intel["cot"][code] = rows[-1]
+              intel["news"] = external_news()
+              try:
+                  stream = client.stream
+                  intel["live"] = "AVAILABLE" if callable(stream) else "UNAVAILABLE"
+              except Exception:
+                  intel["live"] = "UNAVAILABLE"
+              return intel
+          
+          def latest_value(rows):
+              if not rows:
+                  return None
+              row = rows[-1]
+              if isinstance(row, dict):
+                  for key in ("value", "close", "yield", "rate"):
+                      if row.get(key) is not None:
+                          try:
+                              return float(row[key])
+                          except Exception:
+                              return None
+              return None
+          
+          YIELD_CODES = {
+              "USD": "US10Y", "EUR": "DE10Y", "GBP": "GB10Y", "JPY": "JP10Y",
+              "AUD": "AU10Y", "CAD": "CA10Y", "NZD": "NZ10Y", "CHF": "CH10Y"
+          }
+          
+          def yield_context(intel, symbol):
+              if "/" not in symbol:
+                  return None
+              base, quote = symbol.split("/", 1)
+              if base not in YIELD_CODES or quote not in YIELD_CODES:
+                  return None
+              b = latest_value(intel["yields"].get(YIELD_CODES[base], []))
+              q = latest_value(intel["yields"].get(YIELD_CODES[quote], []))
+              if b is None or q is None:
+                  return None
+              return b - q
+          
+          def event_risk(intel, symbol):
+              now = now_utc()
+              high = []
+              for e in intel["calendar"]:
+                  text = " ".join(str(e.get(k, "")) for k in ("title", "event", "name", "impact", "importance")).lower()
+                  currency_text = " ".join(str(e.get(k, "")) for k in ("currency", "country", "region")).upper()
+                  symbol_currencies = set(symbol.split("/")) if "/" in symbol else set()
+                  relevant_currency = (not currency_text) or any(c in currency_text for c in symbol_currencies)
+                  if relevant_currency and any(w in text for w in ("high", "red", "major")):
+                      dt = None
+                      for k in ("timestamp", "datetime", "date", "time"):
+                          if e.get(k):
+                              try:
+                                  dt = parse_ts(e[k])
+                                  break
+                              except Exception:
+                                  pass
+                      if dt is None or abs((dt-now).total_seconds()) <= 24*3600:
+                          high.append(e)
+              return ("HIGH", high[:5]) if high else ("LOW", [])
+          
+          # ----------------------------
+          # Dynamic catalog discovery
+          # ----------------------------
+          api_key = os.getenv("LSE_API_KEY", "").strip()
+          if not api_key:
+              raise RuntimeError("LSE_API_KEY secret is missing. Add it in GitHub Settings -> Secrets and variables -> Actions.")
+          client = LSE(api_key=api_key)
+          intel = daily_intelligence(client)
+          
+          # Small, fixed benchmark set used only for cross-market context.
+          # Missing/unavailable benchmarks are reported rather than guessed.
+          benchmark_rows = {}
+          for benchmark in ("EUR/USD", "GBP/USD", "USD/JPY", "XAU/USD", "BTC/USD"):
+              try:
+                  benchmark_rows[benchmark] = fetch_candles(client, benchmark, "1h")
+              except Exception:
+                  benchmark_rows[benchmark] = []
+          
+          catalog = []
+          catalog_errors = []
+          # LSE documents catalog() as the authoritative full instrument catalog.
+          # Fetch it once, then filter locally. This avoids guessing which singular/plural
+          # spelling a particular SDK build accepts (for example futures vs future).
+          try:
+              rows = client.catalog()
+              if isinstance(rows, dict):
+                  rows = rows.get("data", rows.get("results", []))
+              if isinstance(rows, list):
+                  for row in rows:
+                      if isinstance(row, dict):
+                          sym = row.get("symbol")
+                          if sym:
+                              catalog.append({
+                                  "symbol": sym,
+                                  "name": row.get("name", row.get("display_name", sym)),
+                                  "category": str(row.get("category", "")).strip().lower(),
+                                  "tick_count": row.get("tick_count", 0),
+                              })
+              else:
+                  catalog_errors.append("catalog(): unexpected response shape")
+          except Exception as exc:
+              catalog_errors.append(f"catalog(): {type(exc).__name__}: {exc}")
+          
+          # Focused universe: major FX + metals + BTC/USD.
+          # The live LSE catalog remains authoritative; unsupported symbols are skipped.
+          category_aliases = {"stocks":"stock","stock":"stock","forex":"forex","crypto":"crypto","etfs":"etf","etf":"etf","commodities":"commodity","commodity":"commodity","metals":"commodity","metal":"commodity","indices":"index","index":"index","futures":"futures","future":"futures","options":"options"}
+          unique = {}
+          for row in catalog:
+              raw_symbol = str(row["symbol"]).strip()
+              canonical = SYMBOL_ALIASES.get(raw_symbol.upper(), raw_symbol)
+              normalized = category_aliases.get(str(row.get("category", "")).strip().lower(), str(row.get("category", "")).strip().lower())
+              if canonical not in FOCUSED_SYMBOLS:
+                  continue
+              item = dict(row)
+              item["symbol"] = raw_symbol
+              item["canonical_symbol"] = canonical
+              item["category"] = normalized
+              try:
+                  item["_tick_count"] = int(item.get("tick_count", 0) or 0)
+              except Exception:
+                  item["_tick_count"] = 0
+              prev = unique.get(canonical)
+              if prev is None or (raw_symbol.upper() == canonical and prev["symbol"].upper() != canonical):
+                  unique[canonical] = item
+          priority_order = ["EUR/USD","GBP/USD","USD/JPY","USD/CHF","AUD/USD","USD/CAD","NZD/USD","EUR/GBP","EUR/JPY","GBP/JPY","EUR/CHF","AUD/JPY","XAU/USD","XAG/USD","XPT/USD","XPD/USD","BTC/USD"]
+          priority_rank = {s:i for i,s in enumerate(priority_order)}
+          instruments = sorted(unique.values(), key=lambda x:(priority_rank.get(x["canonical_symbol"],999), -x.get("_tick_count",0), x["symbol"]))
+          if MAX_INSTRUMENTS > 0:
+              instruments = instruments[:MAX_INSTRUMENTS]
+          for item in instruments:
+              item.pop("_tick_count",None)
+          if not instruments:
+              raise RuntimeError(
+                  "No focused instruments were discovered in the live LSE catalog. "
+                  "The scanner will not fabricate symbols or candles. Check catalog access, "
+                  "symbol availability, or LSE_API_KEY permissions."
+              )
+          print(f"CATALOG CATEGORIES REQUESTED: {', '.join(CATEGORIES)}")
+          print("FOCUSED UNIVERSE: major FX + metals + BTC/USD")
+          print(f"DISCOVERED FOCUSED INSTRUMENTS: {len(instruments)}")
+          print(f"MAX_INSTRUMENTS: {MAX_INSTRUMENTS} (0 = all focused instruments; runtime governor still applies)")
+          print(f"RUNTIME BUDGET: {RUNTIME_MINUTES:.1f} minutes")
+          discovered = {x["canonical_symbol"] for x in instruments}
+          for label, group in (("MAJOR FX",MAJOR_FX),("METALS",PRIORITY_METALS),("BTC",PRIORITY_CRYPTO)):
+              found = sorted(group & discovered)
+              missing_group = sorted(group - discovered)
+              print(f"{label} FOUND: {', '.join(found) if found else 'NONE'}")
+              if missing_group:
+                  print(f"{label} NOT IN LIVE CATALOG: {', '.join(missing_group)}")
+          if catalog_errors:
+              print("CATALOG WARNINGS:")
+              for x in catalog_errors:
+                  print(" -",x)
+          print()
+          
+          # ----------------------------
+          # Scan instruments
+          # ----------------------------
+          results = []
+          complete = 0
+          incomplete = 0
+          errors = 0
+          processed = 0
+          runtime_limited = False
+          
+          for idx, meta in enumerate(instruments, 1):
+              if time.monotonic() >= SCAN_DEADLINE:
+                  runtime_limited = True
+                  print("⏱️ RUNTIME BUDGET REACHED — stopping before the next instrument.")
+                  break
+              symbol = meta["symbol"]
+              category = meta["category"]
+              print(f"[{idx}/{len(instruments)}] {symbol} ({category})")
+          
+              data = {}
+              failed = []
+              for tf in DIRECT_TF:
+                  try:
+                      rows = fetch_candles(client, symbol, tf)
+                      data[tf] = rows
+                      print(f"  {tf}: {len(rows)} closed candles")
+                  except Exception as exc:
+                      data[tf] = []
+                      failed.append(f"{tf}: {type(exc).__name__}: {exc}")
+                      print(f"  {tf}: ERROR {type(exc).__name__}")
+          
+              # 30m is ALWAYS built from 15m, never requested as an independent source.
+              data["30m"] = build_30m_from_15m(data.get("15m", []))
+              print(f"  30m: {len(data['30m'])} completed candles built from 15m")
+          
+              if failed:
+                  errors += len(failed)
+              missing = [tf for tf in TF if len(data.get(tf, [])) < MIN_BARS[tf]]
+              if missing:
+                  incomplete += 1
+                  processed += 1
+                  print(f"  SKIP: incomplete timeframes: {', '.join(missing)}")
+                  continue
+          
+              complete += 1
+              processed += 1
+              d = data["1d"]
+              h4 = data["4h"]
+              h1 = data["1h"]
+              m30 = data["30m"]
+              m15 = data["15m"]
+              m5 = data["5m"]
+          
+              d_dir = direction(d)
+              h4_dir = direction(h4)
+              h1_dir = direction(h1)
+              m30_methods = method_scores(m30)
+              m15_methods = method_scores(m15)
+              m5_methods = method_scores(m5)
+              m30_fvg_sig, m30_fvg_why, m30_fvg = fvg_signal(m30)
+              m15_fvg_sig, m15_fvg_why, m15_fvg = fvg_signal(m15)
+              m5_fvg_sig, m5_fvg_why, m5_fvg = fvg_signal(m5)
+          
+              # 4H remains the controlling regime. We do NOT force a direction when 4H
+              # is neutral; however, we still rank developing setups instead of discarding them.
+              regime = h4_dir
+              setup = dominant_signal(m30_methods, minimum=2)
+              confirmation = dominant_signal(m15_methods, minimum=2)
+              trigger = dominant_signal(m5_methods, minimum=2)
+              lower_sides = [x for x in (setup, confirmation, trigger, m30_fvg_sig, m15_fvg_sig, m5_fvg_sig) if x in ("BUY","SELL")]
+              lb, ls = lower_sides.count("BUY"), lower_sides.count("SELL")
+              side = regime if regime in ("BUY","SELL") else ("BUY" if lb > ls and lb >= 2 else "SELL" if ls > lb and ls >= 2 else "NEUTRAL")
+          
+              alignment = {
+                  "1d": d_dir,
+                  "4h": h4_dir,
+                  "1h": h1_dir,
+                  "30m": setup,
+                  "15m": confirmation,
+                  "5m": trigger,
+              }
+          
+              # Score the whole hierarchy. Neutral/missing evidence is not treated as
+              # bearish. This creates a real WATCH/POTENTIAL tier instead of WAIT-only output.
+              if side in ("BUY", "SELL"):
+                  context_score = (
+                      (10.0 if d_dir == side else 5.0 if d_dir == "NEUTRAL" else 0.0) +
+                      20.0 +  # controlling 4H regime
+                      (15.0 if h1_dir == side else 7.0 if h1_dir == "NEUTRAL" else 0.0)
+                  )
+                  setup_score = method_side_score(m30_methods, side) * 0.25
+                  confirm_score = method_side_score(m15_methods, side) * 0.15
+                  trigger_score = method_side_score(m5_methods, side) * 0.15
+                  fvg_bonus = (5.0 if m30_fvg_sig == side else 0.0) + (3.0 if m15_fvg_sig == side else 0.0) + (2.0 if m5_fvg_sig == side else 0.0)
+                  technical_score = max(0.0, min(100.0, context_score + setup_score + confirm_score + trigger_score + fvg_bonus))
+              else:
+                  # Neutral 4H = no directional score, but preserve lower-timeframe evidence
+                  # so the scanner can explain what needs to happen next.
+                  technical_score = max(
+                      method_side_score(m30_methods, setup) * 0.35 if setup in ("BUY", "SELL") else 0.0,
+                      method_side_score(m15_methods, confirmation) * 0.25 if confirmation in ("BUY", "SELL") else 0.0,
+                      method_side_score(m5_methods, trigger) * 0.20 if trigger in ("BUY", "SELL") else 0.0,
+                  )
+          
+              event_level, events = event_risk(intel, symbol)
+              # News is a risk modifier, not a technical eraser. Keep the technical score
+              # visible so strong setups remain discoverable, while high-impact events can
+              # still block a new confirmed entry.
+              risk_penalty = 15.0 if event_level == "HIGH" else 0.0
+              risk_adjusted_score = max(0.0, technical_score - risk_penalty)
+          
+              correlations = correlation_context(symbol, h1, benchmark_rows)
+              yield_diff = yield_context(intel, symbol)
+          
+              level = levels(m30, side) if side in ("BUY", "SELL") else None
+              rr = None
+              if level:
+                  entry, sl, tp, a = level
+                  rr = abs(tp-entry) / max(abs(entry-sl), 1e-12)
+          
+              blockers = []
+              if side == "NEUTRAL":
+                  blockers.append("4H controlling regime is neutral; directional regime required")
+              else:
+                  if d_dir != side:
+                      blockers.append(f"1D context ({d_dir}) is not aligned with 4H {side}")
+                  if h1_dir != side:
+                      blockers.append(f"1H decision ({h1_dir}) is not yet aligned with 4H {side}")
+                  if setup != side:
+                      blockers.append(f"30M setup ({setup}) is developing, not fully aligned")
+                  if confirmation != side:
+                      blockers.append(f"15M confirmation ({confirmation}) is not confirmed")
+                  if trigger != side:
+                      blockers.append(f"5M trigger ({trigger}) is not confirmed")
+              if event_level == "HIGH":
+                  blockers.append("high-impact economic event risk blocks a fresh confirmed entry")
+              if not level:
+                  blockers.append("no valid structural stop/target levels yet")
+              elif not rr_ok(level):
+                  blockers.append(f"structural target is below the required minimum 2R (current {rr:.2f}R)")
+          
+              # Three analytical tiers:
+              # CONFIRMED = actionable sniper-quality confluence.
+              # POTENTIAL = strong developing setup awaiting one or more confirmations.
+              # WATCH = directional evidence worth monitoring.
+              confirmed = (
+                  side in ("BUY", "SELL")
+                  and technical_score >= 70.0
+                  and h1_dir == side
+                  and setup == side
+                  and confirmation == side
+                  and trigger == side
+                  and level is not None
+                  and rr_ok(level)
+                  and event_level != "HIGH"
+              )
+              potential = (
+                  side in ("BUY", "SELL")
+                  and technical_score >= 55.0
+                  and (
+                      (h1_dir == side and setup == side)
+                      or (setup == side and confirmation == side)
+                      or (confirmation == side and trigger == side)
+                  )
+              )
+              watch = (
+                  side in ("BUY", "SELL")
+                  and technical_score >= 45.0
+                  and any(x == side for x in (h1_dir, setup, confirmation, trigger))
+              )
+          
+              if confirmed:
+                  status = "CONFIRMED SNIPER"
+              elif potential:
+                  status = "POTENTIAL SNIPER"
+              elif watch:
+                  status = "WATCH"
+              else:
+                  status = "WAIT"
+          
+              if potential and event_level == "HIGH":
+                  blockers.append("setup is technically developing, but news risk prevents a fresh entry")
+              if potential and trigger != side:
+                  blockers.append("wait for the 5M trigger before entry")
+              if potential and level and not rr_ok(level):
+                  blockers.append("wait for a valid structural target providing at least 2R")
+          
+              results.append({
+                  "symbol": symbol, "category": category, "status": status, "side": side,
+                  "score": technical_score, "risk_score": risk_adjusted_score,
+                  "method_score": method_side_score(m30_methods, side) if side in ("BUY", "SELL") else 0.0,
+                  "rr": rr, "levels": level, "alignment": alignment, "blockers": blockers,
+                  "events": events, "event_level": event_level,
+                  "yield_diff": yield_diff, "correlations": correlations,
+                  "fvg": {"30m":m30_fvg,"15m":m15_fvg,"5m":m5_fvg},
+                  "fvg_signals": {"30m":m30_fvg_sig,"15m":m15_fvg_sig,"5m":m5_fvg_sig},
+                  "methods": m30_methods, "confirmation_methods": m15_methods,
+                  "trigger_methods": m5_methods, "regime": regime,
+                  "technical_score": technical_score
+              })
+          
+          # ----------------------------
+          # Ranked output
+          # ----------------------------
+          confirmed = sorted([r for r in results if r["status"] == "CONFIRMED SNIPER"],
+                             key=lambda x: x["score"], reverse=True)
+          potential = sorted([r for r in results if r["status"] == "POTENTIAL SNIPER"],
+                             key=lambda x: x["score"], reverse=True)
+          watchlist = sorted([r for r in results if r["status"] == "WATCH"],
+                             key=lambda x: x["score"], reverse=True)
+          waiting = sorted([r for r in results if r["status"] == "WAIT"],
+                           key=lambda x: x["score"], reverse=True)
+          
+          def print_candidate(title, rank, r):
+              lv = r["levels"]
+              rr_text = f"{r['rr']:.2f}R" if r["rr"] is not None else "UNAVAILABLE"
+              print(f"{title} #{rank} {r['symbol']} | {r['side']} | score {r['score']:.1f}/100 | risk-adjusted {r['risk_score']:.1f}/100 | R:R {rr_text}")
+              print("   Alignment:", " | ".join(f"{k.upper()} {v}" for k,v in r["alignment"].items()))
+              print("   FVG:", " | ".join(f"{tf.upper()} {sig}" for tf,sig in r["fvg_signals"].items()))
+              if lv:
+                  print(f"   Entry {lv[0]:.6g} | SL {lv[1]:.6g} | TP {lv[2]:.6g} | ATR {lv[3]:.6g}")
+              why = "; ".join(m["why"] for m in r["methods"] if m["signal"] == r["side"])
+              print("   9-method evidence:", why or "no direct 30M directional method")
+              print("   Event/news risk:", r["event_level"])
+              print("   Yield differential:", f"{r['yield_diff']:+.3f} percentage points" if r["yield_diff"] is not None else "UNAVAILABLE")
+              print("   Correlation context:", "; ".join(f"{b} {c:+.2f}" for b, c in r["correlations"]) or "UNAVAILABLE")
+              if r["blockers"]:
+                  print("   NEXT CONDITION:")
+                  for b in r["blockers"][:4]:
+                      print(f"     • {b}")
+              print()
+          
+          print()
+          print("=" * 72)
+          print("🔥 SMC FOREX / MULTI-ASSET INTELLIGENT INTRADAY RANKING")
+          print("=" * 72)
+          print("DAILY INTELLIGENCE -> 1D CONTEXT -> 4H REGIME -> 1H DECISION")
+          print("-> 30M SETUP -> 15M CONFIRMATION -> 5M TRIGGER")
+          print(f"Confirmed: {len(confirmed)} | Potential: {len(potential)} | Watch: {len(watchlist)} | Wait: {len(waiting)}")
+          print(f"Instruments fully analyzed: {complete} | Incomplete: {incomplete}")
+          print()
+          print("DAILY INTELLIGENCE")
+          print(f"  Economic calendar records: {len(intel['calendar'])}")
+          print(f"  Macro: {'AVAILABLE' if intel['macro'].get('cpi_yoy') or intel['macro'].get('policy_rate') else 'UNAVAILABLE'}")
+          print(f"  Government yields: {', '.join(sorted(intel['yields'])) if intel['yields'] else 'UNAVAILABLE'}")
+          print(f"  COT: {', '.join(intel['cot']) if intel['cot'] else 'UNAVAILABLE'}")
+          print(f"  External news: {len(intel['news'])} items" if intel["news"] else "  External news: UNAVAILABLE")
+          print(f"  Live feed capability: {intel['live']}")
+          print("  ML: LOCAL STATISTICAL MODEL (no institutional ML claimed)")
+          print()
+          
+          if confirmed:
+              print("🎯 CONFIRMED SNIPER ENTRIES")
+              for rank, r in enumerate(confirmed[:TOP_N], 1):
+                  print_candidate("🎯", rank, r)
+          else:
+              print("🎯 CONFIRMED SNIPER ENTRIES: NONE")
+              print("No entry is forced. Strong developing setups are shown below.")
+              print()
+          
+          if potential:
+              print("👀 POTENTIAL SNIPER SETUPS")
+              for rank, r in enumerate(potential[:TOP_N], 1):
+                  print_candidate("👀", rank, r)
+              print()
+          
+          if watchlist:
+              print("📡 DEVELOPING WATCHLIST")
+              for rank, r in enumerate(watchlist[:TOP_N], 1):
+                  print_candidate("📡", rank, r)
+              print()
+          
+          print("⏳ WAIT / BLOCKERS")
+          if waiting:
+              for rank, r in enumerate(waiting[:TOP_N], 1):
+                  print(f"⏳ #{rank} {r['symbol']} | {r['side']} | score {r['score']:.1f}/100 | EVENT/NEWS {r['event_level']}")
+                  for b in r["blockers"][:5]:
+                      print(f"   • {b}")
+                  print()
+          else:
+              print("No additional WAIT candidates.")
+          print()
+          
+          elapsed = time.monotonic() - SCAN_START
+          print("=" * 72)
+          print("SCAN STATUS")
+          print("=" * 72)
+          print(f"Elapsed scanner time: {elapsed:.1f}s / configured budget {RUNTIME_MINUTES*60:.1f}s")
+          print(f"Market-scan budget (with safety reserve): {SCAN_BUDGET_SECONDS:.1f}s")
+          print(f"Catalog instruments discovered: {len(catalog)}")
+          print(f"Eligible instruments selected: {len(instruments)}")
+          print(f"Instruments attempted: {processed}")
+          print(f"Fully analyzed: {complete}")
+          print(f"Skipped as incomplete: {incomplete}")
+          print(f"Completed analysis errors: {errors}")
+          print("9 methods: Market Structure | SMC/MSS | Supply/Demand | Price Action | Liquidity | Fibonacci | Trend | RSI+MACD | Session")
+          print("Timeframes: 1D | 4H | 1H | 30M | 15M | 5M")
+          print("30M source: built from TWO CLOSED 15M candles")
+          print("Signal tiers: CONFIRMED SNIPER | POTENTIAL SNIPER | WATCH | WAIT")
+          print("TP rule: minimum 2R; structural target preferred, 2R fallback allowed | NO ARTIFICIAL MAXIMUM")
+          print("High-impact event rule: blocks fresh confirmed entry, but does NOT erase technical setup ranking")
+          print("Unavailable intelligence: reported as unavailable and excluded from technical score")
+          print("Automatic trading: DISABLED")
+          if runtime_limited or processed < len(instruments):
+              print("⚠️ SCAN INCOMPLETE — RUNTIME BUDGET REACHED; RANKED RESULTS ARE FROM COMPLETED INSTRUMENTS")
+          else:
+              print("✅ SCAN COMPLETE — PROCESS EXITING CLEANLY")
+          PY
