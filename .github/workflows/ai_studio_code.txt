@@ -1,0 +1,1 @@
+.github/workflows/smc-holding-scanner.yml
