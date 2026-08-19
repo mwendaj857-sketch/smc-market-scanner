@@ -1728,7 +1728,7 @@ jobs:
 
       - name: Upload scanner results
         if: ${{ always() && hashFiles('scan_results.json') != '' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: scanner-results
           path: scan_results.json
