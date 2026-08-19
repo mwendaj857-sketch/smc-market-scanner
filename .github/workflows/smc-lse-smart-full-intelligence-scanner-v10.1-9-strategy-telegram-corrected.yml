@@ -121,7 +121,7 @@ jobs:
           ]
           assert len(scanner_blocks) == 1, f"Expected exactly one main embedded scanner block, found {len(scanner_blocks)}"
           scanner = scanner_blocks[0]
-          assert "LSE SMART INTRADAY SCANNER v10.1 — 9-STRATEGY INDEPENDENT / ADAPTIVE — VALIDATED" in scanner, "Wrong scanner version embedded in current workflow"
+          assert "LSE SMART INTRADAY SCANNER v10.1 — 9-STRATEGY INDEPENDENT CONSENSUS — VALIDATED" in scanner, "Wrong scanner version embedded in current workflow"
           py = scanner.split("python - <<'PY'\n", 1)[1].split("\nPY", 1)[0]
           
           ast.parse(py)
